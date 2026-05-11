@@ -1,0 +1,101 @@
+<?php
+
+declare(strict_types=1);
+
+namespace LoopPopupBridge\DynamicTags;
+
+if (!defined('ABSPATH')) exit;
+
+use Elementor\Controls_Manager;
+use Elementor\Core\DynamicTags\Tag;
+use Elementor\Modules\DynamicTags\Module as TagsModule;
+use LoopPopupBridge\Support\FieldRegistry;
+
+/**
+ * Text dynamic tag that renders a client-side clicked-post binding placeholder.
+ */
+final class ClickedPostFieldTag extends Tag
+{
+    public function get_name(): string
+    {
+        return 'lpb-clicked-post-field';
+    }
+
+    public function get_title(): string
+    {
+        return esc_html__('Clicked Post Field', 'loop-popup-bridge');
+    }
+
+    public function get_group(): string
+    {
+        return DynamicTagsManager::GROUP;
+    }
+
+    public function get_categories(): array
+    {
+        return [
+            TagsModule::TEXT_CATEGORY,
+            TagsModule::POST_META_CATEGORY,
+        ];
+    }
+
+    public function get_panel_template_setting_key(): string
+    {
+        return 'field';
+    }
+
+    public function is_settings_required(): bool
+    {
+        return true;
+    }
+
+    protected function register_controls(): void
+    {
+        $this->add_control(
+            'field',
+            [
+                'label'   => esc_html__('Field', 'loop-popup-bridge'),
+                'type'    => Controls_Manager::SELECT,
+                'options' => FieldRegistry::get_text_options(),
+                'default' => 'title',
+            ]
+        );
+
+        $this->add_control(
+            'custom_key',
+            [
+                'label'       => esc_html__('Custom Key', 'loop-popup-bridge'),
+                'type'        => Controls_Manager::TEXT,
+                'placeholder' => esc_html__('e.g. event_date', 'loop-popup-bridge'),
+                'description' => esc_html__('Custom keys must be allowed via the lpb_allowed_meta_keys filter.', 'loop-popup-bridge'),
+                'condition'   => ['field' => 'custom'],
+            ]
+        );
+    }
+
+    public function render(): void
+    {
+        $binding = FieldRegistry::resolve_selection(
+            (string) $this->get_settings('field'),
+            (string) $this->get_settings('custom_key')
+        );
+
+        if (null === $binding) {
+            return;
+        }
+
+        $fallback = sanitize_text_field((string) $this->get_settings('fallback'));
+
+        echo '<span data-lpb-field="' . esc_attr($binding['field']) . '"';
+
+        if ('meta' === $binding['field'] && '' !== $binding['meta_key']) {
+            echo ' data-lpb-meta-key="' . esc_attr($binding['meta_key']) . '"';
+        }
+
+        if ('' !== $fallback) {
+            echo ' data-lpb-fallback="' . esc_attr($fallback) . '"';
+        }
+
+        echo '>' . esc_html($fallback) . '</span>';
+    }
+}

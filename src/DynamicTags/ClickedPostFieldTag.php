@@ -54,10 +54,16 @@ final class ClickedPostFieldTag extends Tag
         $this->add_control(
             'field',
             [
-                'label'   => esc_html__('Field', 'loop-popup-bridge'),
-                'type'    => Controls_Manager::SELECT,
-                'options' => FieldRegistry::get_text_options(),
-                'default' => 'title',
+                'label'       => esc_html__('Field', 'loop-popup-bridge'),
+                'type'        => Controls_Manager::SELECT,
+                'groups'      => FieldRegistry::get_text_groups(),
+                // options is required alongside groups: Elementor's panel template
+                // label-lookup checks options[key] first; without it the code falls
+                // into a broken branch that does `controls.key.groups` (literally the
+                // string "key" as a property name) and throws a TypeError.
+                'options'     => FieldRegistry::get_text_options(),
+                'default'     => 'title',
+                'label_block' => true,
             ]
         );
 

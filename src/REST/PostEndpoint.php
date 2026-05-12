@@ -132,8 +132,8 @@ final class PostEndpoint
 
         $data = [
             'id'                 => $post->ID,
-            'title'              => esc_html(get_the_title($post)),
-            'excerpt'            => wp_strip_all_tags(get_the_excerpt($post)),
+            'title'              => wp_kses_post(get_the_title($post)),
+            'excerpt'            => wp_kses_post(get_the_excerpt($post)),
             'content'            => wp_kses_post((string) apply_filters('the_content', $post->post_content)),
             'permalink'          => esc_url((string) get_permalink($post)),
             'featured_image'     => $this->get_featured_image_url($post->ID),
@@ -249,13 +249,15 @@ final class PostEndpoint
 
     /**
      * Sanitizes scalar and common object/array meta values for public JSON output.
+     * Strings are passed through wp_kses_post() so HTML markup (e.g. from ACF
+     * wysiwyg or textarea fields) is preserved while unsafe tags are stripped.
      *
      * @return mixed
      */
     private function sanitize_meta_value(mixed $value): mixed
     {
         if (is_string($value)) {
-            return sanitize_text_field($value);
+            return wp_kses_post($value);
         }
 
         if (is_int($value) || is_float($value) || is_bool($value) || null === $value) {

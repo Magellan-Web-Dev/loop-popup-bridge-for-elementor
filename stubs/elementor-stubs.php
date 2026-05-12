@@ -160,6 +160,13 @@ if (false) {
     }
 
     /**
+     * Base class for Elementor's shared common-stack widgets (Widget_Common,
+     * Widget_Common_Optimized). Used to detect and skip common-stack instances
+     * when injecting controls directly into individual widget stacks.
+     */
+    class Widget_Common_Base extends Widget_Base {}
+
+    /**
      * Manages the global registry of registered Elementor widgets.
      */
     class Widgets_Manager

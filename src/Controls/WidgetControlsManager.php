@@ -61,34 +61,53 @@ final class WidgetControlsManager
      */
     public function __construct()
     {
-        foreach ($this->get_control_anchor_hooks() as $hook) {
-            add_action($hook, [$this, 'register_controls'], 10, 2);
-        }
-
+        // Legacy widgets: inject LPB directly into each widget's own controls stack on
+        // its first section end. Using the individual widget (not the shared common stack)
+        // ensures Elementor includes the section in get_stack(false)['controls'] — the
+        // array the editor actually reads per widget type.
         add_action('elementor/element/after_section_end', [$this, 'register_controls_after_section'], 10, 3);
         add_action('elementor/editor/before_enqueue_scripts', [$this, 'enqueue_editor_visibility_styles']);
         add_action('elementor/editor/after_enqueue_scripts', [$this, 'enqueue_editor_visibility_script']);
+
+        // Atomic widgets (e-image, e-heading, etc.) bypass the legacy common-stack hooks.
+        // The two filters below inject LPB props into their schema (so settings survive save)
+        // and append a Loop Popup Bridge section to their editor control panel.
+        add_filter('elementor/atomic-widgets/props-schema', [$this, 'add_atomic_props_schema']);
+        add_filter('elementor/atomic-widgets/controls',    [$this, 'add_atomic_controls'], 10, 2);
     }
 
     /**
-     * Generic fallback that adds LPB controls after the first Advanced-tab section.
+     * Adds LPB controls to each individual legacy widget's own controls stack.
      *
-     * Elementor has changed the shared widget control stack names across versions
-     * and experiments. This hook fires for every section end, so it catches widgets
-     * even when the named common-stack hooks are not the path Elementor used.
+     * Fires after every section end for every element. Skips:
+     *  - The LPB section itself (prevents infinite recursion).
+     *  - Non-Widget_Base elements (sections, containers, columns).
+     *  - Widget_Common_Base instances (shared common stacks). LPB must live in
+     *    each widget's OWN stack so Elementor includes it in get_stack(false),
+     *    the array the editor reads per widget. Injecting only into Widget_Common
+     *    means the section is NOT in each widget's own get_stack(false) result and
+     *    may be silently omitted from the editor panel for certain widget types.
+     *  - Any widget already processed (deduplication guard).
      *
      * @param  object $element     The Elementor control stack whose section just ended.
      * @param  string $section_id  Elementor section ID.
-     * @param  array  $args        Section arguments passed by Elementor.
+     * @param  array  $_args       Section arguments (unused).
      * @return void
      */
-    public function register_controls_after_section(object $element, string $section_id, array $args): void
+    public function register_controls_after_section(object $element, string $section_id, array $_args): void
     {
-        if ('lpb_section' === $section_id || !$this->is_advanced_tab_section($args)) {
+        // Prevent recursion — we fire end_controls_section() ourselves for lpb_section.
+        if ('lpb_section' === $section_id) {
             return;
         }
 
-        $this->register_controls($element, $args);
+        // Skip common-stack base classes. Their controls merge into widget stacks
+        // separately; we inject LPB into each individual widget instead.
+        if ($element instanceof \Elementor\Widget_Common_Base) {
+            return;
+        }
+
+        $this->register_controls($element, []);
     }
 
     /**
@@ -96,10 +115,10 @@ final class WidgetControlsManager
      *
      * Returns immediately when:
      *   - The element is not a Widget_Base instance (sections, columns, containers).
-     *   - The same common stack has already been processed (deduplication guard).
+     *   - This widget name has already been processed (deduplication guard).
      *
-     * @param  object $element  The Elementor control stack currently being registered.
-     * @param  array  $_args    Section arguments passed by Elementor (not used).
+     * @param  object $element  The Elementor control stack to inject controls into.
+     * @param  array  $_args    Unused.
      * @return void
      */
     public function register_controls(object $element, array $_args): void
@@ -167,42 +186,82 @@ final class WidgetControlsManager
         $element->end_controls_section();
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────────
+    // ── Atomic widget support ─────────────────────────────────────────────────────
 
     /**
-     * Returns the Elementor common-stack hooks that can host widget Advanced controls.
+     * Adds LPB props to every atomic widget's schema so the editor can save them.
      *
-     * @return string[]
+     * The filter receives the schema array without a widget-type argument, so the
+     * props are added to ALL atomic widgets. They are nullable (not required) so
+     * existing widgets that never touched LPB settings pass schema validation fine.
+     *
+     * @param  array $schema  The widget's prop-type schema.
+     * @return array          Modified schema.
      */
-    private function get_control_anchor_hooks(): array
+    public function add_atomic_props_schema(array $schema): array
     {
-        $stack_names  = ['common', 'common-base', 'common-optimized'];
-        $section_ids  = ['_section_style', '_section_layout'];
-        $anchor_hooks = [];
-
-        foreach ($stack_names as $stack_name) {
-            foreach ($section_ids as $section_id) {
-                $anchor_hooks[] = sprintf(
-                    'elementor/element/%s/%s/after_section_end',
-                    $stack_name,
-                    $section_id
-                );
-            }
+        if (!class_exists('Elementor\Modules\AtomicWidgets\PropTypes\Primitives\Boolean_Prop_Type')) {
+            return $schema;
         }
 
-        return $anchor_hooks;
+        $schema['lpb_enable_trigger'] = \Elementor\Modules\AtomicWidgets\PropTypes\Primitives\Boolean_Prop_Type::make();
+        $schema['lpb_popup_id']       = \Elementor\Modules\AtomicWidgets\PropTypes\Primitives\String_Prop_Type::make();
+        $schema['lpb_preload_data']   = \Elementor\Modules\AtomicWidgets\PropTypes\Primitives\Boolean_Prop_Type::make();
+
+        return $schema;
     }
 
     /**
-     * Returns true when a section belongs to Elementor's Advanced tab.
+     * Appends the Loop Popup Bridge section to every atomic widget's control panel.
      *
-     * @param  array $args Section arguments passed by Elementor.
-     * @return bool
+     * Controls must bind to props that exist in the schema; those are added by
+     * add_atomic_props_schema() above.
+     *
+     * @param  array  $controls  The controls array from define_atomic_controls().
+     * @param  object $widget    The atomic widget instance.
+     * @return array             Modified controls array.
      */
-    private function is_advanced_tab_section(array $args): bool
+    public function add_atomic_controls(array $controls, object $widget): array
     {
-        return (string) ($args['tab'] ?? '') === Controls_Manager::TAB_ADVANCED;
+        if (!class_exists('Elementor\Modules\AtomicWidgets\Controls\Section')) {
+            return $controls;
+        }
+
+        $controls[] = \Elementor\Modules\AtomicWidgets\Controls\Section::make()
+            ->set_id('lpb_section')
+            ->set_label(esc_html__('Loop Popup Bridge', 'loop-popup-bridge'))
+            ->set_items([
+                \Elementor\Modules\AtomicWidgets\Controls\Types\Switch_Control::bind_to('lpb_enable_trigger')
+                    ->set_label(esc_html__('Enable Loop Popup Trigger', 'loop-popup-bridge'))
+                    ->set_description(esc_html__('Clicking this widget opens the selected popup and populates it with data from the current loop post.', 'loop-popup-bridge')),
+                \Elementor\Modules\AtomicWidgets\Controls\Types\Select_Control::bind_to('lpb_popup_id')
+                    ->set_label(esc_html__('Popup', 'loop-popup-bridge'))
+                    ->set_options($this->get_atomic_popup_options())
+                    ->set_placeholder(esc_html__('Select a popup…', 'loop-popup-bridge')),
+                \Elementor\Modules\AtomicWidgets\Controls\Types\Switch_Control::bind_to('lpb_preload_data')
+                    ->set_label(esc_html__('Preload Post Data', 'loop-popup-bridge'))
+                    ->set_description(esc_html__('Marks the element so JavaScript pre-fetches this post\'s data on page load rather than waiting for the first click.', 'loop-popup-bridge')),
+            ]);
+
+        return $controls;
     }
+
+    /**
+     * Converts the legacy key→label popup options map into the atomic Select_Control
+     * format: an array of ['value' => id_string, 'label' => display_label] entries.
+     *
+     * @return array<int, array{value: string, label: string}>
+     */
+    private function get_atomic_popup_options(): array
+    {
+        $options = [];
+        foreach ($this->get_popup_options() as $id => $label) {
+            $options[] = ['value' => (string) $id, 'label' => $label];
+        }
+        return $options;
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────────
 
     /**
      * Adds editor CSS that hides LPB controls only while JS marks the editor non-loop.

@@ -222,7 +222,7 @@
                     break;
 
                 default:
-                    // title, excerpt, date, modified, post_type, id — plain text only.
+                    // title, excerpt, date, modified, post_type, id
                     fillTextField(el, resolveBindingValue(binding, postData, 'text'));
                     break;
             }
@@ -385,7 +385,7 @@
     /** Sets textContent; falls back to data-lpb-fallback if value is empty. */
     function fillTextField(el, value) {
         value = normalizeResolvedValue(value, 'text');
-        el.textContent = value !== '' ? value : (el.getAttribute('data-lpb-fallback') || '');
+        el.innerHTML = value !== '' ? value : (el.getAttribute('data-lpb-fallback') || '');
     }
 
     /** Updates src and alt on an <img> [data-lpb-field="featured_image"] element. */

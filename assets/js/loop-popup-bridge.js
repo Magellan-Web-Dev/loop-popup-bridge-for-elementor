@@ -227,6 +227,33 @@
                     break;
             }
         });
+
+        fillFormBindings(container, postData);
+    }
+
+    /**
+     * Finds hidden form inputs whose value attribute holds an lpb-bind: marker
+     * (written by ClickedPostFormValueTag) and sets their live value to the
+     * corresponding clicked-post field. Reads from the HTML attribute (not the
+     * DOM property) so the marker survives repeated popup opens.
+     *
+     * @param {Element} container  The popup DOM node.
+     * @param {Object}  postData   Payload from the REST endpoint.
+     */
+    function fillFormBindings(container, postData) {
+        container.querySelectorAll('input[type="hidden"]').forEach(function (input) {
+            var marker = parseFormValueMarker(input.getAttribute('value'));
+            if (!marker) { return; }
+
+            var resolved = normalizeResolvedValue(
+                resolveBindingValue(marker, postData, 'text'),
+                'text'
+            );
+
+            if (resolved !== '') {
+                input.value = resolved;
+            }
+        });
     }
 
     /** Reads a binding from data attributes or from dynamic-tag URL/image markers. */
@@ -271,6 +298,28 @@
         };
     }
 
+    /**
+     * Parses the plain-text sentinel written by ClickedPostFormValueTag into the
+     * value attribute of a hidden input (e.g. "lpb-bind:title" or
+     * "lpb-bind:meta:event_date"). Returns null when the value is not an LPB marker.
+     */
+    function parseFormValueMarker(value) {
+        value = String(value || '');
+        if (value.indexOf('lpb-bind:') !== 0) { return null; }
+
+        var rest = value.substring('lpb-bind:'.length);
+        var fieldName, metaKey = '';
+
+        if (rest.indexOf('meta:') === 0) {
+            fieldName = 'meta';
+            metaKey   = rest.substring('meta:'.length);
+        } else {
+            fieldName = rest;
+        }
+
+        return fieldName ? { fieldName: fieldName, metaKey: metaKey } : null;
+    }
+
     /** Parses markers like #lpb-field=meta&lpb-meta-key=event_date. */
     function parseBindingMarker(value) {
         value = String(value || '');
@@ -303,6 +352,14 @@
 
             if (binding && binding.fieldName === 'meta' && binding.metaKey) {
                 keys.push(binding.metaKey);
+            }
+        });
+
+        // Also collect meta keys from hidden form inputs using lpb-bind:meta: markers.
+        root.querySelectorAll('input[type="hidden"]').forEach(function (input) {
+            var marker = parseFormValueMarker(input.getAttribute('value'));
+            if (marker && marker.fieldName === 'meta' && marker.metaKey) {
+                keys.push(marker.metaKey);
             }
         });
 

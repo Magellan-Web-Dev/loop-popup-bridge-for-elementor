@@ -26,7 +26,6 @@ if (!defined('ABSPATH')) exit;
  *               ├─ rest_api_init → PostEndpoint   – custom REST route
  *               └─ Elementor Pro active?
  *                    no  → admin notice
- *                    yes → elementor/widgets/register → popup widgets
  */
 final class Plugin
 {
@@ -120,28 +119,9 @@ final class Plugin
             (new REST\PostEndpoint())->register_routes();
         });
 
-        if ($this->checker->is_elementor_pro_active()) {
-            // elementor/widgets/register fires during Elementor's own init, which
-            // has not yet run at this point — safe to hook here.
-            add_action('elementor/widgets/register', [$this, 'register_popup_widgets']);
-        } else {
+        if (!$this->checker->is_elementor_pro_active()) {
             add_action('admin_notices', [$this->checker, 'notice_elementor_pro_missing']);
         }
-    }
-
-    /**
-     * Registers the two popup-side placeholder widgets with Elementor.
-     *
-     * Hooked to elementor/widgets/register, which passes the Widgets_Manager
-     * instance as the first argument.
-     *
-     * @param  object $manager  Elementor\Widgets_Manager instance provided by the hook.
-     * @return void
-     */
-    public function register_popup_widgets(object $manager): void
-    {
-        $manager->register(new Widgets\ClickedPostField());
-        $manager->register(new Widgets\ClickedPostImage());
     }
 
     /**

@@ -13,7 +13,7 @@ final class FieldRegistry
 {
     private const META_PREFIX = 'meta:';
 
-    /** @var array<string, array{label: string, location_label: string}>|null */
+    /** @var array<string, array{label: string, location_label: string, type: string}>|null */
     private static ?array $acf_field_data_cache = null;
 
     // ── Public option builders ────────────────────────────────────────────────────
@@ -131,14 +131,80 @@ final class FieldRegistry
 
     /**
      * Returns selectable fields for image/media Elementor dynamic tag controls.
+     * Only includes ACF fields whose type is "image"; all other custom meta is excluded.
      *
      * @return array<string, string>
      */
     public static function get_image_options(): array
     {
-        return self::filter_options('image', self::append_meta_options([
+        $options = [
             'featured_image' => esc_html__('Featured Image', 'loop-popup-bridge'),
-        ]));
+        ];
+
+        foreach (self::get_acf_field_data() as $key => $data) {
+            if ('image' !== $data['type']) {
+                continue;
+            }
+            $options[self::META_PREFIX . $key] = sprintf(
+                esc_html__('ACF: %s', 'loop-popup-bridge'),
+                $data['label']
+            );
+        }
+
+        $options['custom'] = esc_html__('Custom Key…', 'loop-popup-bridge');
+
+        return self::filter_options('image', $options);
+    }
+
+    /**
+     * Returns a grouped options array for image-capable SELECT controls.
+     * Only includes ACF fields whose type is "image".
+     *
+     * @return list<array{label: string, options: array<string, string>}>
+     */
+    public static function get_image_groups(): array
+    {
+        $groups = [];
+
+        $groups[] = [
+            'label'   => esc_html__('Post Fields', 'loop-popup-bridge'),
+            'options' => [
+                'featured_image' => esc_html__('Featured Image', 'loop-popup-bridge'),
+            ],
+        ];
+
+        $by_location = [];
+        foreach (self::get_acf_field_data() as $key => $data) {
+            if ('image' !== $data['type']) {
+                continue;
+            }
+            $by_location[$data['location_label']][self::META_PREFIX . $key] = $data['label'];
+        }
+
+        foreach ($by_location as $location => $fields) {
+            $label = '' !== $location
+                ? sprintf(
+                    /* translators: %s: post type label */
+                    esc_html__('%s (ACF)', 'loop-popup-bridge'),
+                    $location
+                )
+                : esc_html__('ACF Fields', 'loop-popup-bridge');
+
+            $groups[] = [
+                'label'   => $label,
+                'options' => $fields,
+            ];
+        }
+
+        $groups[] = [
+            'label'   => esc_html__('Other', 'loop-popup-bridge'),
+            'options' => ['custom' => esc_html__('Custom Key…', 'loop-popup-bridge')],
+        ];
+
+        /** @var list<array{label: string, options: array<string, string>}> $filtered */
+        $filtered = (array) apply_filters('lpb_dynamic_tag_field_groups', $groups, 'image');
+
+        return $filtered;
     }
 
     // ── Binding resolution ────────────────────────────────────────────────────────
@@ -354,10 +420,10 @@ final class FieldRegistry
     }
 
     /**
-     * Recursively collects field name → {label, location_label} entries.
+     * Recursively collects field name → {label, location_label, type} entries.
      *
-     * @param array<int, array<string, mixed>>                           $fields
-     * @param array<string, array{label: string, location_label: string}> $data
+     * @param array<int, array<string, mixed>>                                        $fields
+     * @param array<string, array{label: string, location_label: string, type: string}> $data
      */
     private static function collect_acf_field_data(array $fields, string $location_label, array &$data): void
     {
@@ -367,6 +433,7 @@ final class FieldRegistry
                 $data[$name] = [
                     'label'          => (string) ($field['label'] ?? self::label_from_key($name)),
                     'location_label' => $location_label,
+                    'type'           => (string) ($field['type'] ?? ''),
                 ];
             }
 

@@ -7,24 +7,28 @@ namespace LoopPopupBridge\DynamicTags;
 if (!defined('ABSPATH')) exit;
 
 use Elementor\Controls_Manager;
-use Elementor\Core\DynamicTags\Data_Tag;
+use Elementor\Core\DynamicTags\Tag;
 use Elementor\Modules\DynamicTags\Module as TagsModule;
-use Elementor\Utils;
 use LoopPopupBridge\Support\FieldRegistry;
 
 /**
- * Image/media dynamic tag that renders a fallback image URL with a binding marker.
+ * Text dynamic tag for use in Elementor Pro form hidden fields.
+ *
+ * Outputs a plain-text marker (e.g. "lpb-bind:title") that JavaScript recognises
+ * in hidden <input> values and replaces with the clicked post's actual field data
+ * when the popup opens. The marker survives as the HTML value attribute so JS can
+ * re-apply it on every popup open without losing the binding template.
  */
-final class ClickedPostImageTag extends Data_Tag
+final class ClickedPostFormValueTag extends Tag
 {
     public function get_name(): string
     {
-        return 'lpb-clicked-post-image';
+        return 'lpb-clicked-post-form-value';
     }
 
     public function get_title(): string
     {
-        return esc_html__('Clicked Post Image', 'loop-popup-bridge');
+        return esc_html__('Clicked Post Field (Form)', 'loop-popup-bridge');
     }
 
     public function get_group(): string
@@ -35,8 +39,8 @@ final class ClickedPostImageTag extends Data_Tag
     public function get_categories(): array
     {
         return [
-            TagsModule::IMAGE_CATEGORY,
-            TagsModule::MEDIA_CATEGORY,
+            TagsModule::TEXT_CATEGORY,
+            TagsModule::POST_META_CATEGORY,
         ];
     }
 
@@ -57,9 +61,9 @@ final class ClickedPostImageTag extends Data_Tag
             [
                 'label'       => esc_html__('Field', 'loop-popup-bridge'),
                 'type'        => Controls_Manager::SELECT,
-                'groups'      => FieldRegistry::get_image_groups(),
-                'options'     => FieldRegistry::get_image_options(),
-                'default'     => 'featured_image',
+                'groups'      => FieldRegistry::get_text_groups(),
+                'options'     => FieldRegistry::get_text_options(),
+                'default'     => 'title',
                 'label_block' => true,
             ]
         );
@@ -69,43 +73,33 @@ final class ClickedPostImageTag extends Data_Tag
             [
                 'label'       => esc_html__('Custom Key', 'loop-popup-bridge'),
                 'type'        => Controls_Manager::TEXT,
-                'placeholder' => esc_html__('e.g. gallery_card_image', 'loop-popup-bridge'),
+                'placeholder' => esc_html__('e.g. event_date', 'loop-popup-bridge'),
                 'description' => esc_html__('Custom keys must be allowed via the lpb_allowed_meta_keys filter.', 'loop-popup-bridge'),
                 'condition'   => ['field' => 'custom'],
             ]
         );
-
-        $this->add_control(
-            'fallback_image',
-            [
-                'label'   => esc_html__('Fallback Image', 'loop-popup-bridge'),
-                'type'    => Controls_Manager::MEDIA,
-                'default' => ['url' => Utils::get_placeholder_image_src()],
-            ]
-        );
     }
 
-    protected function get_value(array $options = []): array
+    public function render(): void
     {
         $binding = FieldRegistry::resolve_selection(
             (string) $this->get_settings('field'),
             (string) $this->get_settings('custom_key')
         );
 
-        $fallback = (array) $this->get_settings('fallback_image');
-        $url      = esc_url_raw((string) ($fallback['url'] ?? Utils::get_placeholder_image_src()));
-
-        if ('' === $url) {
-            $url = Utils::get_placeholder_image_src();
+        if (null === $binding) {
+            return;
         }
 
-        if (null !== $binding) {
-            $url = FieldRegistry::add_marker_query_args($url, $binding);
+        // Plain-text sentinel: "lpb-bind:title" or "lpb-bind:meta:event_date".
+        // JS reads input[type="hidden"] value attributes for this prefix and
+        // replaces input.value with the actual clicked-post field data.
+        $marker = 'lpb-bind:' . $binding['field'];
+
+        if ('meta' === $binding['field'] && '' !== $binding['meta_key']) {
+            $marker .= ':' . $binding['meta_key'];
         }
 
-        return [
-            'id'  => 0,
-            'url' => $url,
-        ];
+        echo esc_html($marker);
     }
 }

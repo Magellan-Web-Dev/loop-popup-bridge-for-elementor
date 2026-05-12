@@ -2,8 +2,8 @@
 
 Click any widget inside an Elementor Loop Grid item to open a shared Elementor Pro popup that is automatically populated with data from the post that was clicked.
 
-**Version:** 1.0.1  
-**Requires:** WordPress 6.0+, PHP 8.1+, Elementor (free), Elementor Pro
+- **Requires:** WordPress 6.0+, PHP 8.1+, Elementor, Elementor Pro
+- **Tested with:** Elementor 4.0.1, Elementor Pro 4.0.1
 
 ---
 
@@ -15,12 +15,12 @@ Elementor's Loop Grid widget repeats a template for every post in a query. The L
 
 ## Requirements
 
-| Dependency | Minimum Version |
+| Dependency | Requirement |
 |---|---|
 | WordPress | 6.0 |
 | PHP | 8.1 |
-| Elementor (free) | 3.x |
-| Elementor Pro | 3.x |
+| Elementor (free) | Required |
+| Elementor Pro | Required for popup functionality |
 
 ---
 
@@ -34,7 +34,7 @@ This works for every widget type — legacy widgets (Button, Image, Text, etc.) 
 
 ### 2. Populate the Popup with Dynamic Tags
 
-Inside your popup, use the four included dynamic tags to bind elements to the clicked post's data. Dynamic tags are available in any field that supports them (text, link, image source, etc.).
+Inside your popup, use the included dynamic tags to bind elements to the clicked post's data. Dynamic tags are available in fields that support the relevant dynamic tag category, such as text, link URL, image source, and Elementor Form hidden values.
 
 | Dynamic Tag | Use In | Output |
 |---|---|---|
@@ -43,7 +43,7 @@ Inside your popup, use the four included dynamic tags to bind elements to the cl
 | **Clicked Post Image** | Image source fields | Inserts a query-arg marker that JS replaces with the image URL |
 | **Clicked Post Form Value** | Elementor Form hidden inputs | Writes an `lpb-bind:` marker that JS replaces with the field value before submit |
 
-**Available field names for Clicked Post Field / URL / Form Value:**
+**Available built-in fields:**
 
 - `title` — post title (plain text)
 - `excerpt` — post excerpt
@@ -53,15 +53,17 @@ Inside your popup, use the four included dynamic tags to bind elements to the cl
 - `modified` — last-modified date
 - `post_type` — post type slug
 - `id` — post ID
-- `featured_image` — featured image URL
-- `meta` — any custom field value (enter the meta key separately)
+- `featured_image` — featured image URL, available in image-capable bindings
+- `meta` — custom field value, selected from discovered ACF fields or entered manually by key
+
+ACF fields are discovered automatically and grouped in the dynamic tag controls by field group location. Manual non-ACF meta keys must be allowed with the `lpb_allowed_meta_keys` filter before the REST endpoint will return them.
 
 ### 3. Click → Populate → Open
 
 When a visitor clicks a trigger widget:
 
 1. JavaScript reads the `data-lpb-post-id` and `data-lpb-popup-id` attributes on the wrapper.
-2. Post data is fetched from the plugin's secured REST endpoint (`/wp-json/loop-popup-bridge/v1/post/{id}`). Results are cached in memory so repeated clicks on the same post never hit the network twice.
+2. Post data is fetched from the plugin's public read-only REST endpoint (`/wp-json/loop-popup-bridge/v1/post/{id}`). Results are cached in memory so repeated clicks on the same post avoid repeated network requests.
 3. The Elementor Pro popup is opened via `elementorProFrontend.modules.popup.showPopup()`.
 4. Every `[data-lpb-field]` placeholder inside the popup is replaced with the matching field value from the REST response.
 
@@ -77,7 +79,7 @@ loop-popup-bridge-for-elementor/
 │   ├── Plugin.php                        Singleton composition root; boots all components
 │   ├── DependencyChecker.php             Checks for Elementor / Elementor Pro; surfaces admin notices
 │   ├── Controls/
-│   │   └── WidgetControlsManager.php     Injects Loop Popup Bridge section into every widget's Advanced tab
+│   │   └── WidgetControlsManager.php     Injects Loop Popup Bridge controls into legacy and atomic widgets
 │   ├── Frontend/
 │   │   └── FrontendManager.php           Writes data-lpb-* attributes at render time; enqueues JS
 │   ├── DynamicTags/
@@ -86,8 +88,12 @@ loop-popup-bridge-for-elementor/
 │   │   ├── ClickedPostUrlTag.php         Hash-marker placeholder for link URL fields
 │   │   ├── ClickedPostImageTag.php       Query-arg marker for image source fields; ACF image fields only
 │   │   └── ClickedPostFormValueTag.php   Plain-text lpb-bind: marker for Elementor Form hidden inputs
-│   └── REST/
-│       └── PostEndpoint.php              GET /wp-json/loop-popup-bridge/v1/post/{id}
+│   ├── REST/
+│   │   └── PostEndpoint.php              GET /wp-json/loop-popup-bridge/v1/post/{id}
+│   ├── Support/
+│   │   └── FieldRegistry.php             Shared field options, ACF discovery, binding helpers, meta allowlist
+│   └── Updates/
+│       └── GitHubUpdater.php             GitHub release checks and update package handling
 ├── assets/
 │   └── js/
 │       └── loop-popup-bridge.js          Click handler, REST fetch with cache, popup open, field fill
@@ -114,8 +120,11 @@ loop-popup-bridge-for-elementor/
 GET /wp-json/loop-popup-bridge/v1/post/{id}
 ```
 
-- **Authentication:** WordPress REST nonce (`X-WP-Nonce` header), validated by `wp_verify_nonce`.
-- **Custom meta:** Opt-in only. Meta keys must be registered via the `lpb_allowed_meta_keys` filter; the default allowlist is empty for security.
+- **Authentication:** None required. This is a public read-only endpoint for publicly available content.
+- **Access checks:** The post must exist, have `publish` status, not be password-protected, and belong to a public post type.
+- **Custom meta:** Callers request specific keys with `?meta_keys=key1,key2`. The endpoint returns only requested keys that are allowlisted server-side.
+- **ACF fields:** Registered ACF fields are automatically included in the allowlist so popup bindings work without extra configuration.
+- **Manual meta keys:** Non-ACF keys must be added through the `lpb_allowed_meta_keys` filter.
 
 **Example response:**
 
@@ -137,7 +146,7 @@ GET /wp-json/loop-popup-bridge/v1/post/{id}
 }
 ```
 
-**Exposing custom meta fields:**
+**Exposing manual custom meta fields:**
 
 ```php
 add_filter('lpb_allowed_meta_keys', function (array $keys): array {
@@ -146,6 +155,8 @@ add_filter('lpb_allowed_meta_keys', function (array $keys): array {
     return $keys;
 });
 ```
+
+Because registered ACF fields are automatically allowlisted, any visitor who can reach the endpoint and knows a field key can request that field for published posts. Do not store sensitive public-post data in ACF fields that this plugin should expose.
 
 ---
 
@@ -164,7 +175,29 @@ Elementor's newer atomic widgets (widget types prefixed with `e-`, such as `e-im
 
 ---
 
+## Updates
+
+The plugin includes a GitHub-based updater. WordPress checks the latest published GitHub release, caches the response for 12 hours, and shows the normal plugin update UI when a newer release is available.
+
+The Plugins screen also adds a **Check for updates** row action. That action is nonce-protected and requires the `update_plugins` capability.
+
+---
+
 ## Changelog
+
+### 1.0.4
+- Added GitHub release update checks and a manual "Check for updates" plugin row action.
+- Added folder normalization after GitHub archive installs so updates keep the canonical plugin directory name.
+- Updated Elementor compatibility metadata through Elementor 4.0.1 and Elementor Pro 4.0.1.
+
+### 1.0.3
+- Improved dynamic tag field handling with shared field registry helpers.
+- Added automatic ACF field discovery for text, URL, and image-capable bindings.
+- Added server-side custom meta allowlisting for manually entered keys.
+
+### 1.0.2
+- Added popup-side dynamic tags for URL, image, and Elementor Form hidden-value bindings.
+- Improved frontend field hydration, custom meta fetching, and client-side caching.
 
 ### 1.0.1
 - Added support for Elementor atomic widgets (e-image, e-heading, e-button, etc.) in both the editor panel and the frontend trigger system.
@@ -173,7 +206,7 @@ Elementor's newer atomic widgets (widget types prefixed with `e-`, such as `e-im
 - Initial release.
 - Loop Popup Bridge controls in every widget's Advanced tab.
 - Four dynamic tags: Clicked Post Field, Clicked Post URL, Clicked Post Image, Clicked Post Form Value.
-- Secured REST endpoint with opt-in custom meta.
+- Public read-only REST endpoint for published posts with opt-in manual custom meta.
 - Client-side post-data cache to eliminate repeated network requests.
 - Preload option for above-the-fold items.
 

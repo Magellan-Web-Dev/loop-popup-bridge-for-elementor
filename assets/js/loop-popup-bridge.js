@@ -250,9 +250,7 @@
                 'text'
             );
 
-            if (resolved !== '') {
-                input.value = resolved;
-            }
+            input.value = resolved !== '' ? resolved : marker.fallback;
         });
     }
 
@@ -301,13 +299,22 @@
     /**
      * Parses the plain-text sentinel written by ClickedPostFormValueTag into the
      * value attribute of a hidden input (e.g. "lpb-bind:title" or
-     * "lpb-bind:meta:event_date"). Returns null when the value is not an LPB marker.
+     * "lpb-bind:meta:event_date|fallback=TBD"). Returns null when the value is not an LPB marker.
      */
     function parseFormValueMarker(value) {
         value = String(value || '');
         if (value.indexOf('lpb-bind:') !== 0) { return null; }
 
         var rest = value.substring('lpb-bind:'.length);
+        var fallback = '';
+        var fallbackSeparator = '|fallback=';
+        var fallbackIndex = rest.indexOf(fallbackSeparator);
+
+        if (fallbackIndex !== -1) {
+            fallback = decodeMarkerValue(rest.substring(fallbackIndex + fallbackSeparator.length));
+            rest = rest.substring(0, fallbackIndex);
+        }
+
         var fieldName, metaKey = '';
 
         if (rest.indexOf('meta:') === 0) {
@@ -317,7 +324,16 @@
             fieldName = rest;
         }
 
-        return fieldName ? { fieldName: fieldName, metaKey: metaKey } : null;
+        return fieldName ? { fieldName: fieldName, metaKey: metaKey, fallback: fallback } : null;
+    }
+
+    /** Decodes optional marker values without letting malformed data break binding. */
+    function decodeMarkerValue(value) {
+        try {
+            return decodeURIComponent(String(value || ''));
+        } catch (err) {
+            return '';
+        }
     }
 
     /** Parses markers like #lpb-field=meta&lpb-meta-key=event_date. */

@@ -6,6 +6,8 @@ namespace LoopPopupBridge;
 
 if (!defined('ABSPATH')) exit;
 
+use LoopPopupBridge\Updates\GitHubUpdater;
+
 /**
  * Main plugin singleton.
  *
@@ -86,6 +88,8 @@ final class Plugin
      */
     private function boot(): void
     {
+        GitHubUpdater::init();
+
         if (!$this->checker->is_elementor_active()) {
             add_action('admin_notices', [$this->checker, 'notice_elementor_missing']);
             return;

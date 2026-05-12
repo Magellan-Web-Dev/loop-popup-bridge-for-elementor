@@ -100,6 +100,11 @@ final class ClickedPostFormValueTag extends Tag
             $marker .= ':' . $binding['meta_key'];
         }
 
+        $fallback = sanitize_text_field((string) $this->get_settings('fallback'));
+        if ('' !== $fallback) {
+            $marker .= '|fallback=' . rawurlencode($fallback);
+        }
+
         echo esc_html($marker);
     }
 }

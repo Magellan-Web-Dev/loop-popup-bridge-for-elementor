@@ -24,23 +24,50 @@ declare(strict_types=1);
 
 if (!defined('ABSPATH')) exit;
 
-/** @var string Plugin version. */
-define('LPB_VERSION', '1.0.0');
+/**
+ * PHP version guard.
+ *
+ * This file must not use PHP 8.1+ syntax directly. PHP parses the entire file
+ * before executing any branch, so 8.1+ syntax here would cause a fatal parse
+ * error on older runtimes before this guard ever runs. PHP 8.1+ code is safely
+ * isolated in the separately required files inside the else block below.
+ */
+if (version_compare(PHP_VERSION, '8.1', '<')) {
+    add_action('admin_notices', function () {
+        echo '<div class="notice notice-error"><p>';
+        printf(
+            '<strong>Loop Popup Bridge For Elementor</strong> requires PHP 8.1 or higher. '
+            . 'Your server is running PHP %s. Please contact your host to upgrade PHP before activating this plugin.',
+            esc_html(PHP_VERSION)
+        );
+        echo '</p></div>';
+    });
 
-/** @var string Absolute path to the main plugin file. */
-define('LPB_FILE', __FILE__);
+/**
+ * Main plugin class and bootstrap logic.
+ * Contains the Plugin class which serves as the composition root for the entire plugin,
+ * and the activation/deactivation hooks and plugins_loaded handler that instantiate and initialize the plugin.
+ */
+} else {
 
-/** @var string Absolute path to the plugin root directory (with trailing slash). */
-define('LPB_PATH', plugin_dir_path(__FILE__));
+    /** @var string Plugin version. */
+    define('LPB_VERSION', '1.0.0');
 
-/** @var string Public URL to the plugin root directory (with trailing slash). */
-define('LPB_URL', plugin_dir_url(__FILE__));
+    /** @var string Absolute path to the main plugin file. */
+    define('LPB_FILE', __FILE__);
 
-// Require and register the class-based PSR-4 autoloader before anything else.
-require_once LPB_PATH . 'src/Autoloader.php';
-\LoopPopupBridge\Autoloader::register();
+    /** @var string Absolute path to the plugin root directory (with trailing slash). */
+    define('LPB_PATH', plugin_dir_path(__FILE__));
 
-// Initialise after all plugins are loaded so ELEMENTOR_VERSION is already defined.
-add_action('plugins_loaded', static function (): void {
-    \LoopPopupBridge\Plugin::instance();
-}, 20);
+    /** @var string Public URL to the plugin root directory (with trailing slash). */
+    define('LPB_URL', plugin_dir_url(__FILE__));
+
+    // Require and register the class-based PSR-4 autoloader before anything else.
+    require_once LPB_PATH . 'src/Autoloader.php';
+    \LoopPopupBridge\Autoloader::register();
+
+    // Initialise after all plugins are loaded so ELEMENTOR_VERSION is already defined.
+    add_action('plugins_loaded', static function (): void {
+        \LoopPopupBridge\Plugin::instance();
+    }, 20);
+}

@@ -45,6 +45,8 @@ final class DynamicTagsManager
 
         $dynamic_tags->register(new ClickedPostFieldTag());
         $dynamic_tags->register(new ClickedPostFormValueTag());
+        $dynamic_tags->register(new ClickedPostFormSelectTag());
+        $dynamic_tags->register(new ClickedPostFormRadioTag());
         $dynamic_tags->register(new ClickedPostUrlTag());
         $dynamic_tags->register(new ClickedPostImageTag());
     }

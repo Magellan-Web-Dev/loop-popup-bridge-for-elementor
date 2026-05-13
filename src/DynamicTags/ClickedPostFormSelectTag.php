@@ -14,21 +14,21 @@ use LoopPopupBridge\Support\FieldRegistry;
 /**
  * Text dynamic tag for use in Elementor Pro form hidden fields.
  *
- * Outputs a plain-text marker (e.g. "lpb-bind:title") that JavaScript recognises
- * in hidden <input> values and replaces with the clicked post's actual field data
- * when the popup opens. The marker survives as the HTML value attribute so JS can
- * re-apply it on every popup open without losing the binding template.
+ * Outputs a plain-text marker (e.g. "lpb-bind-select:colors|target=field_abc123")
+ * that JavaScript reads to dynamically populate a <select> element's <option> children
+ * with the clicked post's field data. An array value generates multiple options;
+ * a string generates a single option.
  */
-final class ClickedPostFormValueTag extends Tag
+final class ClickedPostFormSelectTag extends Tag
 {
     public function get_name(): string
     {
-        return 'lpb-clicked-post-form-value';
+        return 'lpb-clicked-post-form-select';
     }
 
     public function get_title(): string
     {
-        return esc_html__('Clicked Post Field (Form Text)', 'loop-popup-bridge');
+        return esc_html__('Clicked Post Field (Form Select)', 'loop-popup-bridge');
     }
 
     public function get_group(): string
@@ -73,11 +73,28 @@ final class ClickedPostFormValueTag extends Tag
             [
                 'label'       => esc_html__('Custom Key', 'loop-popup-bridge'),
                 'type'        => Controls_Manager::TEXT,
-                'placeholder' => esc_html__('e.g. event_date', 'loop-popup-bridge'),
+                'placeholder' => esc_html__('e.g. event_options', 'loop-popup-bridge'),
                 'description' => esc_html__('Custom keys must be allowed via the lpb_allowed_meta_keys filter.', 'loop-popup-bridge'),
                 'condition'   => ['field' => 'custom'],
             ]
         );
+
+        $this->add_control(
+            'usage_hint',
+            [
+                'type' => Controls_Manager::RAW_HTML,
+                'raw'  => '<div style="padding:8px 10px;background:#f5f5f5;border-left:3px solid #007cba;font-size:12px;line-height:1.6">'
+                    . '<strong>' . esc_html__('How to use', 'loop-popup-bridge') . '</strong><br>'
+                    . esc_html__('This tag outputs a marker string. Paste that string as the Value of one option inside your Elementor form\'s Select field. JS replaces it with the clicked post\'s data at runtime and removes the marker from the page automatically.', 'loop-popup-bridge')
+                    . '<br><br>'
+                    . '<strong>' . esc_html__('Marker format', 'loop-popup-bridge') . '</strong><br>'
+                    . '<code style="background:#e0e0e0;padding:1px 4px">lpb-bind-select:<em>field</em></code><br>'
+                    . '<code style="background:#e0e0e0;padding:1px 4px">lpb-bind-select:meta:<em>key</em></code>'
+                    . '</div>',
+                'content_classes' => 'elementor-descriptor',
+            ]
+        );
+
     }
 
     public function render(): void
@@ -91,10 +108,7 @@ final class ClickedPostFormValueTag extends Tag
             return;
         }
 
-        // Plain-text sentinel: "lpb-bind:title" or "lpb-bind:meta:event_date".
-        // JS reads input[type="hidden"] value attributes for this prefix and
-        // replaces input.value with the actual clicked-post field data.
-        $marker = 'lpb-bind:' . $binding['field'];
+        $marker = 'lpb-bind-select:' . $binding['field'];
 
         if ('meta' === $binding['field'] && '' !== $binding['meta_key']) {
             $marker .= ':' . $binding['meta_key'];

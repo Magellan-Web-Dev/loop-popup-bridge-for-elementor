@@ -229,28 +229,232 @@
         });
 
         fillFormBindings(container, postData);
+        fillChoiceFieldsByMarkers(container, postData);
     }
 
     /**
-     * Finds hidden form inputs whose value attribute holds an lpb-bind: marker
-     * (written by ClickedPostFormValueTag) and sets their live value to the
-     * corresponding clicked-post field. Reads from the HTML attribute (not the
-     * DOM property) so the marker survives repeated popup opens.
+     * Fills scalar form fields (hidden, text, email, textarea, etc.) whose value
+     * attribute / defaultValue holds an lpb-bind: marker written by
+     * ClickedPostFormValueTag. Reads from the HTML attribute so the marker
+     * survives repeated popup opens.
      *
      * @param {Element} container  The popup DOM node.
      * @param {Object}  postData   Payload from the REST endpoint.
      */
     function fillFormBindings(container, postData) {
-        container.querySelectorAll('input[type="hidden"]').forEach(function (input) {
-            var marker = parseFormValueMarker(input.getAttribute('value'));
+        container.querySelectorAll('input:not([type="radio"]):not([type="checkbox"]), textarea').forEach(function (el) {
+            var attrValue = el.tagName === 'TEXTAREA' ? el.defaultValue : el.getAttribute('value');
+            var marker = parseFormValueMarker(attrValue);
             if (!marker) { return; }
 
             var resolved = normalizeResolvedValue(
                 resolveBindingValue(marker, postData, 'text'),
                 'text'
             );
+            el.value = resolved !== '' ? resolved : marker.fallback;
+        });
+    }
 
-            input.value = resolved !== '' ? resolved : marker.fallback;
+    /**
+     * Parses a hidden-input marker for select or radio bindings.
+     *
+     * Format: "{prefix}{field}[|target={id}][|fallback={val}]"
+     * e.g.    "lpb-bind-select:meta:colors|target=field_abc|fallback=Default"
+     *
+     * Returns null when the value does not start with the given prefix.
+     *
+     * @param  {string} value   The raw HTML value attribute.
+     * @param  {string} prefix  "lpb-bind-select:" or "lpb-bind-radio:"
+     * @return {Object|null}
+     */
+    function parseFormChoiceMarker(value, prefix) {
+        value = String(value || '');
+        if (value.indexOf(prefix) !== 0) { return null; }
+
+        var rest   = value.substring(prefix.length);
+        var params = {};
+
+        var parts = rest.split('|');
+        var bindingPart = parts[0];
+
+        for (var i = 1; i < parts.length; i++) {
+            var eqIdx = parts[i].indexOf('=');
+            if (eqIdx !== -1) {
+                var key = parts[i].substring(0, eqIdx);
+                var val = decodeMarkerValue(parts[i].substring(eqIdx + 1));
+                params[key] = val;
+            }
+        }
+
+        var fieldName, metaKey = '';
+
+        if (bindingPart.indexOf('meta:') === 0) {
+            fieldName = 'meta';
+            metaKey   = bindingPart.substring('meta:'.length);
+        } else {
+            fieldName = bindingPart;
+        }
+
+        return fieldName ? {
+            fieldName: fieldName,
+            metaKey:   metaKey,
+            target:    params['target']   || '',
+            fallback:  params['fallback'] || '',
+        } : null;
+    }
+
+    /**
+     * Normalizes any resolved post-data value to an array of {value, label} items
+     * suitable for populating select options or radio buttons.
+     *
+     * - null / undefined / '' → []
+     * - string or number      → [{value: str, label: str}]
+     * - array of scalars      → [{value: item, label: item}, ...]
+     * - array of objects      → [{value: obj.value|obj.id, label: obj.label|obj.name|obj.title}, ...]
+     *
+     * @param  {*}      value
+     * @param  {string} fallback  Used when value resolves to empty.
+     * @return {Array<{value: string, label: string}>}
+     */
+    function resolveToOptionItems(value, fallback) {
+        if (value === null || typeof value === 'undefined' || value === '' || value === false ||
+                (Array.isArray(value) && value.length === 0)) {
+            value = fallback || '';
+        }
+        if (value === null || typeof value === 'undefined' || value === '' || value === false) {
+            return [];
+        }
+
+        if (!Array.isArray(value)) {
+            value = [value];
+        }
+
+        return value.map(function (item) {
+            if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean') {
+                var str = String(item);
+                return { value: str, label: str };
+            }
+            if (typeof item === 'object' && item !== null) {
+                var v = String(item.value  || item.id    || item.key   || '');
+                var l = String(item.label  || item.name  || item.title || v);
+                return { value: v, label: l };
+            }
+            return null;
+        }).filter(Boolean);
+    }
+
+    /**
+     * Runs once at page init. Finds every select option and radio input whose
+     * value holds an lpb-bind marker, moves the marker string onto the parent
+     * element as data-lpb-marker (and data-lpb-name for radios), then removes
+     * the placeholder option/input from the DOM so it is never visible.
+     */
+    function initChoiceFieldMarkers() {
+        document.querySelectorAll('option[value^="lpb-bind-select:"]').forEach(function (markerOpt) {
+            var selectEl = markerOpt.parentElement;
+            if (!selectEl || selectEl.tagName !== 'SELECT') { return; }
+            selectEl.setAttribute('data-lpb-marker', markerOpt.getAttribute('value'));
+            selectEl.removeChild(markerOpt);
+        });
+
+        document.querySelectorAll('input[type="radio"][value^="lpb-bind-radio:"]').forEach(function (markerInput) {
+            var subgroup = markerInput.closest('.elementor-field-subgroup') || markerInput.parentElement;
+            if (!subgroup) { return; }
+            subgroup.setAttribute('data-lpb-marker', markerInput.getAttribute('value'));
+            subgroup.setAttribute('data-lpb-name',   markerInput.name);
+            var markerItem = markerInput.closest('.elementor-radio-item') || markerInput.parentElement;
+            if (markerItem && markerItem !== subgroup) {
+                subgroup.removeChild(markerItem);
+            }
+        });
+    }
+
+    /**
+     * Fills select and radio fields whose binding was stored by initChoiceFieldMarkers.
+     * Reads data-lpb-marker from the parent <select> or .elementor-field-subgroup,
+     * removes previously LPB-appended items, cleans blank static options, then
+     * appends new items from the clicked post's data (or a single fallback option).
+     *
+     * @param {Element} container  The popup DOM node.
+     * @param {Object}  postData   Payload from the REST endpoint.
+     */
+    function fillChoiceFieldsByMarkers(container, postData) {
+
+        // ── Select fields ─────────────────────────────────────────────────────
+        container.querySelectorAll('select[data-lpb-marker]').forEach(function (selectEl) {
+            var marker = parseFormChoiceMarker(selectEl.getAttribute('data-lpb-marker'), 'lpb-bind-select:');
+            if (!marker) { return; }
+
+            var rawValue   = resolveBindingValue(marker, postData, 'text');
+            var isFallback = marker.fallback !== '' &&
+                (rawValue === null || rawValue === undefined || rawValue === '' || rawValue === false ||
+                 (Array.isArray(rawValue) && rawValue.length === 0));
+            var items = resolveToOptionItems(rawValue, marker.fallback);
+
+            selectEl.querySelectorAll('option[data-lpb]').forEach(function (opt) {
+                opt.parentNode.removeChild(opt);
+            });
+
+            selectEl.querySelectorAll('option').forEach(function (opt) {
+                if (opt.textContent.trim() === '') {
+                    opt.parentNode.removeChild(opt);
+                }
+            });
+
+            if (isFallback) {
+                selectEl.querySelectorAll('option').forEach(function (opt) {
+                    opt.selected = false;
+                    opt.removeAttribute('selected');
+                });
+            }
+
+            items.forEach(function (item) {
+                var opt = document.createElement('option');
+                opt.value       = item.value;
+                opt.textContent = item.label;
+                opt.setAttribute('data-lpb', '');
+                if (isFallback) {
+                    opt.selected = true;
+                }
+                selectEl.appendChild(opt);
+            });
+        });
+
+        // ── Radio groups ──────────────────────────────────────────────────────
+        container.querySelectorAll('.elementor-field-subgroup[data-lpb-marker]').forEach(function (subgroup) {
+            var marker   = parseFormChoiceMarker(subgroup.getAttribute('data-lpb-marker'), 'lpb-bind-radio:');
+            var nameAttr = subgroup.getAttribute('data-lpb-name') || '';
+            if (!marker || !nameAttr) { return; }
+
+            var items = resolveToOptionItems(resolveBindingValue(marker, postData, 'text'), marker.fallback);
+
+            subgroup.querySelectorAll('[data-lpb]').forEach(function (item) {
+                item.parentNode.removeChild(item);
+            });
+
+            items.forEach(function (item, index) {
+                var inputId = 'lpb-radio-' + nameAttr.replace(/[^a-z0-9_-]/gi, '-') + '-' + index;
+
+                var wrapper = document.createElement('div');
+                wrapper.className = 'elementor-radio-item';
+                wrapper.setAttribute('data-lpb', '');
+
+                var input = document.createElement('input');
+                input.type      = 'radio';
+                input.id        = inputId;
+                input.name      = nameAttr;
+                input.value     = item.value;
+                input.className = 'elementor-field';
+
+                var label = document.createElement('label');
+                label.setAttribute('for', inputId);
+                label.className   = 'elementor-field-label';
+                label.textContent = item.label;
+
+                wrapper.appendChild(input);
+                wrapper.appendChild(label);
+                subgroup.appendChild(wrapper);
+            });
         });
     }
 
@@ -371,9 +575,25 @@
             }
         });
 
-        // Also collect meta keys from hidden form inputs using lpb-bind:meta: markers.
-        root.querySelectorAll('input[type="hidden"]').forEach(function (input) {
-            var marker = parseFormValueMarker(input.getAttribute('value'));
+        // Text markers on scalar inputs / textareas.
+        root.querySelectorAll('input:not([type="radio"]):not([type="checkbox"]), textarea').forEach(function (el) {
+            var attrValue = el.tagName === 'TEXTAREA' ? el.defaultValue : el.getAttribute('value');
+            var marker = parseFormValueMarker(attrValue);
+            if (marker && marker.fieldName === 'meta' && marker.metaKey) {
+                keys.push(marker.metaKey);
+            }
+        });
+
+        // Choice markers stored as data-lpb-marker after initChoiceFieldMarkers() ran.
+        root.querySelectorAll('select[data-lpb-marker]').forEach(function (el) {
+            var marker = parseFormChoiceMarker(el.getAttribute('data-lpb-marker'), 'lpb-bind-select:');
+            if (marker && marker.fieldName === 'meta' && marker.metaKey) {
+                keys.push(marker.metaKey);
+            }
+        });
+
+        root.querySelectorAll('.elementor-field-subgroup[data-lpb-marker]').forEach(function (el) {
+            var marker = parseFormChoiceMarker(el.getAttribute('data-lpb-marker'), 'lpb-bind-radio:');
             if (marker && marker.fieldName === 'meta' && marker.metaKey) {
                 keys.push(marker.metaKey);
             }
@@ -640,6 +860,9 @@
     // ── Initialisation ────────────────────────────────────────────────────────────
 
     function init() {
+        // Move lpb-bind-select/radio marker strings off DOM options into data attributes.
+        initChoiceFieldMarkers();
+
         // Delegated click listener — catches trigger clicks anywhere on the page,
         // including items loaded dynamically by Elementor's Loop Grid infinite scroll.
         document.addEventListener('click', handleTriggerClick, true);

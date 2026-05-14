@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Loop Popup Bridge for Elementor
  * Description:       Click any widget inside an Elementor Loop Grid item to open a shared Elementor Pro popup dynamically populated from that post.
- * Version:           1.0.9
+ * Version:           1.1.0
  * Author:            Chris Paschall
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
@@ -51,7 +51,7 @@ if (version_compare(PHP_VERSION, '8.1', '<')) {
 } else {
 
     /** @var string Plugin version. */
-    define('LPB_VERSION', '1.0.9');
+    define('LPB_VERSION', '1.1.0');
 
     /** @var string Absolute path to the main plugin file. */
     define('LPB_FILE', __FILE__);

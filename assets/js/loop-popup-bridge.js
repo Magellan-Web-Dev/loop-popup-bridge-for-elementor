@@ -344,20 +344,47 @@
     }
 
     /**
-     * Runs once at page init. Finds every select option and radio input whose
-     * value holds an lpb-bind marker, moves the marker string onto the parent
-     * element as data-lpb-marker (and data-lpb-name for radios), then removes
-     * the placeholder option/input from the DOM so it is never visible.
+     * Scans `root` for lpb-bind-select/radio markers and moves them onto their
+     * parent element as data-lpb-marker, then removes the placeholder element.
+     *
+     * Handles two layouts produced by Elementor's form options editor:
+     *
+     *   Normal  — full marker is in the value attribute:
+     *             <option value="lpb-bind-select:meta:key|fallback=X">…</option>
+     *
+     *   Split   — Elementor's "Label|Value" textarea format divided the marker:
+     *             <option value="fallback=X">lpb-bind-select:meta:key</option>
+     *             In this case we reconstruct the full marker from textContent + '|' + value.
+     *
+     * The same two layouts apply to radio inputs (label text vs. input value).
+     *
+     * @param {Element|Document} root  Scope for the DOM search.
      */
-    function initChoiceFieldMarkers() {
-        document.querySelectorAll('option[value^="lpb-bind-select:"]').forEach(function (markerOpt) {
+    function moveChoiceMarkersToParent(root) {
+
+        // ── Select: normal case ───────────────────────────────────────────────
+        root.querySelectorAll('option[value^="lpb-bind-select:"]').forEach(function (markerOpt) {
             var selectEl = markerOpt.parentElement;
             if (!selectEl || selectEl.tagName !== 'SELECT') { return; }
             selectEl.setAttribute('data-lpb-marker', markerOpt.getAttribute('value'));
             selectEl.removeChild(markerOpt);
         });
 
-        document.querySelectorAll('input[type="radio"][value^="lpb-bind-radio:"]').forEach(function (markerInput) {
+        // ── Select: split case (Elementor label|value textarea format) ────────
+        root.querySelectorAll('option').forEach(function (markerOpt) {
+            var text     = (markerOpt.textContent || '').trim();
+            var selectEl = markerOpt.parentElement;
+            if (!text || text.indexOf('lpb-bind-select:') !== 0) { return; }
+            if (!selectEl || selectEl.tagName !== 'SELECT') { return; }
+            if (selectEl.hasAttribute('data-lpb-marker')) { return; }
+            var suffix = markerOpt.getAttribute('value') || '';
+            if (suffix.indexOf('lpb-bind-select:') === 0) { return; }
+            selectEl.setAttribute('data-lpb-marker', suffix ? text + '|' + suffix : text);
+            selectEl.removeChild(markerOpt);
+        });
+
+        // ── Radio: normal case ────────────────────────────────────────────────
+        root.querySelectorAll('input[type="radio"][value^="lpb-bind-radio:"]').forEach(function (markerInput) {
             var subgroup = markerInput.closest('.elementor-field-subgroup') || markerInput.parentElement;
             if (!subgroup) { return; }
             subgroup.setAttribute('data-lpb-marker', markerInput.getAttribute('value'));
@@ -367,6 +394,30 @@
                 subgroup.removeChild(markerItem);
             }
         });
+
+        // ── Radio: split case ─────────────────────────────────────────────────
+        root.querySelectorAll('input[type="radio"]').forEach(function (markerInput) {
+            var labelEl = markerInput.nextElementSibling;
+            if (!labelEl || labelEl.tagName !== 'LABEL') { return; }
+            var text = (labelEl.textContent || '').trim();
+            if (!text || text.indexOf('lpb-bind-radio:') !== 0) { return; }
+            var subgroup = markerInput.closest('.elementor-field-subgroup') || markerInput.parentElement;
+            if (!subgroup) { return; }
+            if (subgroup.hasAttribute('data-lpb-marker')) { return; }
+            var suffix = markerInput.getAttribute('value') || '';
+            if (suffix.indexOf('lpb-bind-radio:') === 0) { return; }
+            subgroup.setAttribute('data-lpb-marker', suffix ? text + '|' + suffix : text);
+            subgroup.setAttribute('data-lpb-name',   markerInput.name);
+            var markerItem = markerInput.closest('.elementor-radio-item') || markerInput.parentElement;
+            if (markerItem && markerItem !== subgroup) {
+                subgroup.removeChild(markerItem);
+            }
+        });
+    }
+
+    /** Runs once at page init — delegates to moveChoiceMarkersToParent. */
+    function initChoiceFieldMarkers() {
+        moveChoiceMarkersToParent(document);
     }
 
     /**
@@ -379,6 +430,10 @@
      * @param {Object}  postData   Payload from the REST endpoint.
      */
     function fillChoiceFieldsByMarkers(container, postData) {
+
+        // Lazily pick up any markers not yet moved by initChoiceFieldMarkers,
+        // including Elementor-split markers (see moveChoiceMarkersToParent).
+        moveChoiceMarkersToParent(container);
 
         // ── Select fields ─────────────────────────────────────────────────────
         container.querySelectorAll('select[data-lpb-marker]').forEach(function (selectEl) {
@@ -410,10 +465,13 @@
 
             items.forEach(function (item) {
                 var opt = document.createElement('option');
-                opt.value       = item.value;
+                opt.value       = isFallback ? '' : item.value;
                 opt.textContent = item.label;
                 opt.setAttribute('data-lpb', '');
                 if (isFallback) {
+                    opt.classList.add('lpb-fallback');
+                    opt.setAttribute('data-novalue', '');
+                    opt.setAttribute('selected', '');
                     opt.selected = true;
                 }
                 selectEl.appendChild(opt);
@@ -584,7 +642,7 @@
             }
         });
 
-        // Choice markers stored as data-lpb-marker after initChoiceFieldMarkers() ran.
+        // Choice markers — already moved to data-lpb-marker by initChoiceFieldMarkers.
         root.querySelectorAll('select[data-lpb-marker]').forEach(function (el) {
             var marker = parseFormChoiceMarker(el.getAttribute('data-lpb-marker'), 'lpb-bind-select:');
             if (marker && marker.fieldName === 'meta' && marker.metaKey) {
@@ -594,6 +652,21 @@
 
         root.querySelectorAll('.elementor-field-subgroup[data-lpb-marker]').forEach(function (el) {
             var marker = parseFormChoiceMarker(el.getAttribute('data-lpb-marker'), 'lpb-bind-radio:');
+            if (marker && marker.fieldName === 'meta' && marker.metaKey) {
+                keys.push(marker.metaKey);
+            }
+        });
+
+        // Choice markers not yet moved (popup DOM added after page init).
+        root.querySelectorAll('option[value^="lpb-bind-select:"]').forEach(function (el) {
+            var marker = parseFormChoiceMarker(el.getAttribute('value'), 'lpb-bind-select:');
+            if (marker && marker.fieldName === 'meta' && marker.metaKey) {
+                keys.push(marker.metaKey);
+            }
+        });
+
+        root.querySelectorAll('input[type="radio"][value^="lpb-bind-radio:"]').forEach(function (el) {
+            var marker = parseFormChoiceMarker(el.getAttribute('value'), 'lpb-bind-radio:');
             if (marker && marker.fieldName === 'meta' && marker.metaKey) {
                 keys.push(marker.metaKey);
             }

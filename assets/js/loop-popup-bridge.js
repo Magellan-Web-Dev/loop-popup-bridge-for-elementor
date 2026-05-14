@@ -465,7 +465,7 @@
 
             items.forEach(function (item) {
                 var opt = document.createElement('option');
-                opt.value       = isFallback ? '' : item.label;
+                opt.value       = isFallback ? item.label : item.value;
                 opt.textContent = item.label;
                 opt.setAttribute('data-lpb', '');
                 if (isFallback) {

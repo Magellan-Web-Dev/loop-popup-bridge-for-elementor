@@ -83,13 +83,13 @@ final class ClickedPostFormRadioTag extends Tag
             'usage_hint',
             [
                 'type' => Controls_Manager::RAW_HTML,
-                'raw'  => '<div style="padding:8px 10px;background:#f5f5f5;border-left:3px solid #007cba;font-size:12px;line-height:1.6">'
+                'raw'  => '<div style="padding:8px 10px;border-left:3px solid #007cba;font-size:12px;line-height:1.6">'
                     . '<strong>' . esc_html__('How to use', 'loop-popup-bridge') . '</strong><br>'
                     . esc_html__('This tag outputs a marker string. Paste that string as the Value of one radio option inside your Elementor form\'s Radio field. JS replaces it with the clicked post\'s data at runtime and removes the marker from the page automatically.', 'loop-popup-bridge')
                     . '<br><br>'
                     . '<strong>' . esc_html__('Marker format', 'loop-popup-bridge') . '</strong><br>'
-                    . '<code style="background:#e0e0e0;padding:1px 4px">lpb-bind-radio:<em>field</em></code><br>'
-                    . '<code style="background:#e0e0e0;padding:1px 4px">lpb-bind-radio:meta:<em>key</em></code>'
+                    . '<code style="padding:1px 4px">lpb-bind-radio:<em>field</em></code><br>'
+                    . '<code style="padding:1px 4px">lpb-bind-radio:meta:<em>key</em></code>'
                     . '</div>',
                 'content_classes' => 'elementor-descriptor',
             ]

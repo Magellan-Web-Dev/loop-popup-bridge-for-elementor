@@ -875,6 +875,10 @@
         fetchPostData(postId, metaKeys).then(function (postData) {
             // Pre-fill while popup is still hidden — no flash of empty content.
             if (postData) {
+                document.dispatchEvent(new CustomEvent('lpb:item-selected', {
+                    bubbles: true,
+                    detail: { postId: postId, popupId: popupId, post: postData }
+                }));
                 populatePopupFields(postData, popupId);
             }
 

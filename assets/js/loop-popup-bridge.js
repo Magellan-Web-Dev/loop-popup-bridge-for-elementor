@@ -853,9 +853,9 @@
         if (!trigger) { return; }
 
         event.preventDefault();
-        event.stopPropagation();
+        event.stopImmediatePropagation();
 
-        var postId  = parseInt(trigger.getAttribute('data-lpb-post-id'),  10);
+        var postId  = parseInt(trigger.getAttribute('data-lpb-post-id'), 10);
         var popupId = parseInt(trigger.getAttribute('data-lpb-popup-id'), 10);
 
         if (!postId || !popupId) {
@@ -863,35 +863,34 @@
             return;
         }
 
-        LPB.activePostId  = postId;
-        LPB.activePopupId = popupId;
+        requestAnimationFrame(function () {
+            requestAnimationFrame(function () {
+                LPB.activePostId  = postId;
+                LPB.activePopupId = popupId;
 
-        var metaKeys = collectRequiredMetaKeys(popupId);
+                var metaKeys = collectRequiredMetaKeys(popupId);
 
-        // 1. Fetch post data (instant if cached).
-        // 2. Pre-populate before showing so fields are ready when the popup animates in.
-        // 3. Open the popup.
-        // 4. Re-populate after open to handle any dynamic Elementor re-renders.
-        fetchPostData(postId, metaKeys).then(function (postData) {
-            // Pre-fill while popup is still hidden — no flash of empty content.
-            if (postData) {
-                document.dispatchEvent(new CustomEvent('lpb:item-selected', {
-                    bubbles: true,
-                    detail: { postId: postId, popupId: popupId, post: postData }
-                }));
-                populatePopupFields(postData, popupId);
-            }
+                fetchPostData(postId, metaKeys).then(function (postData) {
+                    if (postData) {
+                        document.dispatchEvent(new CustomEvent('lpb:item-selected', {
+                            bubbles: true,
+                            detail: { postId: postId, popupId: popupId, post: postData }
+                        }));
 
-            return openElementorPopup(popupId).then(function () {
-                return postData;
-            });
-        }).then(function (postData) {
-            // Fill again after popup becomes visible (covers Elementor re-render on show).
-            if (postData) {
-                return fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (freshPostData) {
-                    populatePopupFields(freshPostData || postData, popupId);
+                        populatePopupFields(postData, popupId);
+                    }
+
+                    return openElementorPopup(popupId).then(function () {
+                        return postData;
+                    });
+                }).then(function (postData) {
+                    if (postData) {
+                        return fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (freshPostData) {
+                            populatePopupFields(freshPostData || postData, popupId);
+                        });
+                    }
                 });
-            }
+            });
         });
     }
 

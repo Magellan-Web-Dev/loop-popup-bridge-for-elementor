@@ -13,6 +13,26 @@ final class FieldRegistry
 {
     private const META_PREFIX = 'meta:';
 
+    /**
+     * ACF field types whose stored value is an email address.
+     *
+     * Used to tag URL bindings so the frontend can prepend `mailto:`.
+     */
+    private const EMAIL_FIELD_TYPES = ['email'];
+
+    /**
+     * Field types whose stored value is a telephone number.
+     *
+     * Core ACF ships no native phone field, so this list covers the type
+     * identifiers registered by the common third-party phone add-ons. Generic
+     * `text` and `number` fields are deliberately excluded — use the
+     * `lpb_url_binding_value_type` filter to opt those in explicitly.
+     */
+    private const PHONE_FIELD_TYPES = ['phone_number', 'phone', 'tel', 'telephone'];
+
+    /** Value types the frontend understands for URL bindings. */
+    private const URL_VALUE_TYPES = ['email', 'phone'];
+
     /** @var array<string, array{label: string, location_label: string, type: string}>|null */
     private static ?array $acf_field_data_cache = null;
 
@@ -244,6 +264,11 @@ final class FieldRegistry
     /**
      * Returns an href-safe marker for URL dynamic tags.
      *
+     * When the binding points at a field whose value is an email address or a
+     * telephone number, the marker carries an extra `lpb-value-type` segment so
+     * the frontend can prepend the matching URI scheme (`mailto:` / `tel:`).
+     * Ordinary URL bindings keep the original two-segment marker.
+     *
      * @param array{field: string, meta_key: string} $binding
      */
     public static function get_hash_marker(array $binding): string
@@ -254,7 +279,64 @@ final class FieldRegistry
             $marker .= '&lpb-meta-key=' . rawurlencode($binding['meta_key']);
         }
 
+        $value_type = self::resolve_url_value_type($binding);
+
+        if ('' !== $value_type) {
+            $marker .= '&lpb-value-type=' . rawurlencode($value_type);
+        }
+
         return $marker;
+    }
+
+    /**
+     * Resolves the value type of a URL binding: "email", "phone", or "" for an
+     * ordinary URL.
+     *
+     * The type is derived from the registered ACF field type only — never from
+     * the field label, the meta key, or the stored value itself. Fields that are
+     * not registered with ACF (manually allowlisted meta, post fields such as
+     * the permalink) resolve to "" unless a project opts them in.
+     *
+     * Filter: `lpb_url_binding_value_type`
+     *   @param string                                                              $value_type Resolved type ("email", "phone", or "").
+     *   @param string                                                              $meta_key   Custom field key, or "" for built-in post fields.
+     *   @param array{label: string, location_label: string, type: string}|null     $field_data ACF field data when the key is a registered ACF field.
+     *   @param array{field: string, meta_key: string}                              $binding    The full binding being rendered.
+     *
+     * Returned values outside the supported set are discarded, so a filter can
+     * only ever classify a binding as email, phone, or ordinary URL.
+     *
+     * @param array{field: string, meta_key: string} $binding
+     */
+    public static function resolve_url_value_type(array $binding): string
+    {
+        $meta_key = 'meta' === $binding['field'] ? $binding['meta_key'] : '';
+
+        $field_data = ('' !== $meta_key)
+            ? (self::get_acf_field_data()[$meta_key] ?? null)
+            : null;
+
+        $value_type = '';
+
+        if (null !== $field_data) {
+            $acf_type = strtolower($field_data['type']);
+
+            if (in_array($acf_type, self::EMAIL_FIELD_TYPES, true)) {
+                $value_type = 'email';
+            } elseif (in_array($acf_type, self::PHONE_FIELD_TYPES, true)) {
+                $value_type = 'phone';
+            }
+        }
+
+        $value_type = (string) apply_filters(
+            'lpb_url_binding_value_type',
+            $value_type,
+            $meta_key,
+            $field_data,
+            $binding
+        );
+
+        return in_array($value_type, self::URL_VALUE_TYPES, true) ? $value_type : '';
     }
 
     /**
@@ -350,12 +432,13 @@ final class FieldRegistry
     }
 
     /**
-     * Returns all ACF fields keyed by field name, each carrying its label and a
-     * resolved location label (post type display name or group title).
+     * Returns all ACF fields keyed by field name, each carrying its label, a
+     * resolved location label (post type display name or group title), and the
+     * registered ACF field type.
      *
      * Results are cached for the lifetime of the request.
      *
-     * @return array<string, array{label: string, location_label: string}>
+     * @return array<string, array{label: string, location_label: string, type: string}>
      */
     private static function get_acf_field_data(): array
     {

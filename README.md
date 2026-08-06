@@ -160,6 +160,37 @@ Because registered ACF fields are automatically allowlisted, any visitor who can
 
 ---
 
+## Email and Phone URLs
+
+When a **Clicked Post URL** binding points at a field that holds an email address or a telephone number, the frontend prepends the matching URI scheme so the link works as a link:
+
+| Field type | Value | Rendered `href` |
+| --- | --- | --- |
+| ACF `email` | `test@example.com` | `mailto:test@example.com` |
+| Phone add-on (`phone_number`, `phone`, `tel`, `telephone`) | `+1 555 123 4567` | `tel:+1 555 123 4567` |
+
+Notes:
+
+- The classification comes from the **registered field type only** — never from the field label, the meta key, or the shape of the stored value.
+- Values that already carry a scheme (`mailto:`, `tel:`, `https:`, …) are left alone, so nothing is double-prefixed.
+- The number itself is never rewritten: `+`, spaces, parentheses, hyphens, and extensions are preserved exactly as entered.
+- Only the URL binding is affected. The same field used through **Clicked Post Field** or as an Elementor form value still yields the original, unprefixed value, as does the REST response.
+
+Core ACF ships no phone field. If you store phone numbers in a plain Text or Number field — or use an add-on with a different type identifier — opt the field in explicitly:
+
+```php
+add_filter('lpb_url_binding_value_type', function (string $type, string $meta_key, ?array $field_data, array $binding): string {
+    if ('office_phone' === $meta_key) {
+        return 'phone'; // or 'email'
+    }
+    return $type;
+}, 10, 4);
+```
+
+Only `'email'`, `'phone'`, and `''` (ordinary URL) are accepted; anything else is discarded, and the existing URL protocol allowlist still decides whether the final link is rendered.
+
+---
+
 ## Preloading
 
 When **Preload Post Data** is enabled on a trigger widget, the plugin fetches that post's data as soon as the page loads. This eliminates the network delay on the first click and is recommended for above-the-fold loop items.

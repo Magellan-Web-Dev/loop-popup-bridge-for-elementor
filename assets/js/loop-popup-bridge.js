@@ -131,8 +131,12 @@
 
     /**
      * Opens an Elementor Pro popup by its numeric ID.
-     * Falls back to a custom DOM event so the call is safe even when the Pro module
-     * is not available (e.g. during Elementor editor preview without Pro loaded).
+     *
+     * showPopup({ id }) is the only supported opening API. `elementor/popup/show`
+     * is a notification Elementor emits *after* a popup opened, so dispatching it
+     * ourselves opens nothing — when the Pro popup module is unavailable (Pro
+     * inactive, or an editor preview without Pro) there is nothing to open and we
+     * say so rather than firing a no-op event.
      *
      * @param  {number} popupId
      * @return {Promise<void>} Resolves after a short delay to let the popup enter the DOM.
@@ -145,10 +149,7 @@
         ) {
             window.elementorProFrontend.modules.popup.showPopup({ id: popupId });
         } else {
-            // Fallback: Elementor Pro also listens to this custom event internally.
-            document.dispatchEvent(
-                new CustomEvent('elementor/popup/show', { detail: { id: popupId } })
-            );
+            console.warn('LPB: Elementor Pro popup module unavailable — cannot open popup ' + popupId + '.');
         }
 
         // Give the popup ~120 ms to become visible in the DOM before we try to fill it.
@@ -158,19 +159,33 @@
     // ── Field population ──────────────────────────────────────────────────────────
 
     /**
-     * Finds the popup DOM node for the given popup ID.
-     * Elementor Pro renders all popups in the page footer as hidden elements;
-     * they are always in the DOM — just toggled visible when opened.
+     * Finds the outer modal wrapper Elementor Pro created for the given popup ID.
+     *
+     * Elementor's actual popup lifecycle (elementor-pro/assets/js/elements-handlers.js
+     * plus elementor/assets/lib/dialog/dialog.js):
+     *
+     *  - The popup document printed on the page is removed on init and kept only as
+     *    an HTML string, so none of the popup is in the DOM before its first open.
+     *  - The first open lazily creates the wrapper `#elementor-popup-modal-{id}`, and
+     *    every open clones fresh inner content into it. The wrapper is appended
+     *    before the `elementor/popup/show` notification fires, so it reliably exists
+     *    by the time Elementor tells us the popup opened.
+     *  - Hiding removes the cloned content but leaves the wrapper in the DOM, so once
+     *    two popups have been opened two wrappers coexist and only the exact element
+     *    ID identifies the one we were asked for.
+     *
+     * `data-elementor-id` is set on the inner Elementor document, never on this
+     * wrapper, so the wrapper is addressed by ID alone. Returns null while the popup
+     * has no wrapper yet; there is deliberately no fallback, because every other
+     * `.elementor-popup-modal` in the page belongs to a different popup.
      *
      * @param  {number} popupId
      * @return {Element|null}
      */
     function getPopupContainer(popupId) {
-        // Elementor Pro marks the popup wrapper with data-elementor-id.
-        return (
-            document.querySelector('.elementor-popup-modal[data-elementor-id="' + popupId + '"]') ||
-            document.querySelector('.elementor-popup-modal') // fallback: first open popup
-        );
+        popupId = parseInt(popupId, 10);
+
+        return popupId ? document.getElementById('elementor-popup-modal-' + popupId) : null;
     }
 
     var bindingSelector = [
@@ -659,9 +674,16 @@
 
     /** Finds all custom meta keys required by bindings in a popup. */
     function collectRequiredMetaKeys(popupId) {
-        var container = getPopupContainer(popupId);
-        var root      = container || document;
-        var keys      = [];
+        var root = getPopupContainer(popupId);
+        var keys = [];
+
+        if (!root) {
+            // This popup has no DOM yet, so none of its bindings can be read.
+            // Scanning the whole document instead would collect the meta keys of a
+            // *different* popup whose wrapper is still in the page; the post-show
+            // pass collects the real keys once this popup's own content exists.
+            return keys;
+        }
 
         root.querySelectorAll(bindingSelector).forEach(function (el) {
             var binding = getBinding(el);
@@ -888,14 +910,32 @@
     }
 
     /**
-     * Top-level populate call. Finds the popup container, then fills fields.
-     * If the popup is not yet in the DOM (edge case), retries once after 150 ms.
+     * True while (postId, popupId) is still the selection the user last made.
+     * Guards the async population paths so a slow REST response for an earlier
+     * click cannot overwrite fields after a newer click took over the context.
+     */
+    function isActiveContext(postId, popupId) {
+        return LPB.activePostId === postId && LPB.activePopupId === popupId;
+    }
+
+    /**
+     * Top-level populate call. Fills the bindings of the requested popup only.
+     * When that popup's wrapper does not exist yet (it is still opening), retries
+     * once after 150 ms — no other popup is ever populated instead.
      *
      * @param {Object} postData
      * @param {number} popupId
+     * @param {number} [postId]  When given, population is skipped once the user has
+     *                           selected a different post or popup.
      */
-    function populatePopupFields(postData, popupId) {
+    function populatePopupFields(postData, popupId, postId) {
         if (!postData) { return; }
+
+        var isStale = function () {
+            return typeof postId !== 'undefined' && !isActiveContext(postId, popupId);
+        };
+
+        if (isStale()) { return; }
 
         var container = getPopupContainer(popupId);
 
@@ -904,10 +944,10 @@
             return;
         }
 
-        // Popup not found yet — retry once after a short delay.
+        // Wrapper not created yet — retry once after a short delay.
         setTimeout(function () {
             var retryContainer = getPopupContainer(popupId);
-            if (retryContainer) {
+            if (retryContainer && !isStale()) {
                 fillFields(retryContainer, postData);
             }
         }, 150);
@@ -949,7 +989,7 @@
                             detail: { postId: postId, popupId: popupId, post: postData }
                         }));
 
-                        populatePopupFields(postData, popupId);
+                        populatePopupFields(postData, popupId, postId);
                     }
 
                     return openElementorPopup(popupId).then(function () {
@@ -958,7 +998,7 @@
                 }).then(function (postData) {
                     if (postData) {
                         return fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (freshPostData) {
-                            populatePopupFields(freshPostData || postData, popupId);
+                            populatePopupFields(freshPostData || postData, popupId, postId);
                         });
                     }
                 });
@@ -966,24 +1006,52 @@
         });
     }
 
-    // ── Elementor popup open hook ─────────────────────────────────────────────────
+    // ── Elementor popup show notification ─────────────────────────────────────────
 
     /**
-     * Called by Elementor Pro's frontend hooks system when any popup opens.
-     * Re-populates fields in case Elementor re-renders the popup DOM on show.
+     * Elementor Pro announces a single show twice — as a jQuery event on the document
+     * and as a native CustomEvent on window (triggerPopupEvent() in
+     * elementor-pro/assets/js/elements-handlers.js dispatches both back to back in the
+     * same task). Collapsing them on a flag cleared on the next macrotask keeps one
+     * show to one hydration, while a genuine later re-open — which cannot happen
+     * inside that same task — still hydrates normally.
+     */
+    var handledShows = {};
+
+    function isDuplicateShowEvent(popupId) {
+        var key = String(popupId);
+
+        if (handledShows[key]) { return true; }
+
+        handledShows[key] = true;
+        setTimeout(function () { delete handledShows[key]; }, 0);
+
+        return false;
+    }
+
+    /**
+     * Runs when Elementor reports that a popup opened. The wrapper and its freshly
+     * cloned content are in the DOM by now, so this is the first moment the popup's
+     * own bindings — and therefore its custom meta keys — can be read.
      *
      * @param {number|string} id  The popup ID reported by Elementor.
      */
     function onPopupShow(id) {
         var popupId = parseInt(id, 10);
 
+        if (!popupId || isDuplicateShowEvent(popupId)) {
+            return;
+        }
+
         if (!LPB.activePostId || popupId !== LPB.activePopupId) {
             return; // Not our popup or no active post — leave it alone.
         }
 
-        fetchPostData(LPB.activePostId, collectRequiredMetaKeys(popupId)).then(function (postData) {
+        var postId = LPB.activePostId;
+
+        fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (postData) {
             if (postData) {
-                populatePopupFields(postData, popupId);
+                populatePopupFields(postData, popupId, postId);
             }
         });
     }
@@ -1015,7 +1083,25 @@
         // including items loaded dynamically by Elementor's Loop Grid infinite scroll.
         document.addEventListener('click', handleTriggerClick, true);
 
-        // Hook into Elementor's frontend hooks system (most reliable method).
+        // Primary notification: the jQuery event Elementor Pro triggers on the
+        // document as (event, id, instance).
+        if (typeof window.jQuery !== 'undefined') {
+            window.jQuery(document).on('elementor/popup/show', function (event, id) {
+                onPopupShow(id);
+            });
+        }
+
+        // The same notification as a native CustomEvent on window, so hydration keeps
+        // working if a build stops emitting the jQuery one. Both reach onPopupShow,
+        // which collapses the pair into a single hydration.
+        window.addEventListener('elementor/popup/show', function (event) {
+            if (event && event.detail) {
+                onPopupShow(event.detail.id);
+            }
+        });
+
+        // Kept for backward compatibility only: current Elementor Pro does not route
+        // this event through elementorFrontend.hooks.
         if (
             typeof window.elementorFrontend !== 'undefined' &&
             window.elementorFrontend.hooks &&
@@ -1025,14 +1111,6 @@
                 'elementor/popup/show',
                 function (id /*, instance */) { onPopupShow(id); }
             );
-        }
-
-        // Also wire up via jQuery event for older Elementor Pro versions that fire
-        // a jQuery event rather than going through the hooks system.
-        if (typeof window.jQuery !== 'undefined') {
-            window.jQuery(document).on('elementor/popup/show', function (event, id) {
-                onPopupShow(id);
-            });
         }
 
         preloadMarkedItems();

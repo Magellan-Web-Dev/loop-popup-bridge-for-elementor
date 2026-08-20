@@ -68,6 +68,31 @@
         });
     }
 
+    /**
+     * True when a binding reads a custom meta key that has never been requested
+     * from the server for this post.
+     *
+     * This is the difference between "not loaded yet" and "loaded and empty":
+     *
+     *  - Requested and returned empty (or not on the server allowlist, so it can
+     *    never arrive) counts as loaded — the field renders its configured
+     *    fallback, which is the correct empty state.
+     *  - Never requested is unknown, not empty. Writing to such a field would
+     *    erase the value a more complete payload already put on screen, which is
+     *    exactly the first-open race this guard exists to stop.
+     *
+     * @param  {Object|null} binding  Anything carrying {fieldName, metaKey}.
+     * @param  {number}      postId
+     * @return {boolean}
+     */
+    function isUnloadedMetaBinding(binding, postId) {
+        if (!binding || binding.fieldName !== 'meta' || !binding.metaKey) {
+            return false;
+        }
+
+        return !(LPB.postMetaKeys[postId] || {})[binding.metaKey];
+    }
+
     /** Builds the REST URL, including requested meta keys when needed. */
     function buildPostUrl(postId, metaKeys) {
         var url = LPB.restUrl + postId;
@@ -77,6 +102,37 @@
         }
 
         return url;
+    }
+
+    /**
+     * Requests currently in flight, keyed by post ID + the exact key set requested.
+     * The popup-show path and the post-open pass ask for the same keys at almost the
+     * same moment; sharing one promise means one round-trip and one cache write
+     * instead of two responses whose arrival order would decide the result.
+     *
+     * @type {Object<string, Promise<Object|null>>}
+     */
+    var inFlightRequests = {};
+
+    /**
+     * Folds a fresh response into whatever is already cached for the post.
+     *
+     * Values from the newer response win, but a key an earlier response resolved is
+     * never dropped: a request that did not ask for a key says nothing about it, so
+     * a narrow response landing after a wide one must not shrink the cache. Applied
+     * unconditionally (the previous version skipped the merge whenever either side
+     * had no custom_meta, which let such a response downgrade the cache).
+     *
+     * @param  {number} postId
+     * @param  {Object} data   Parsed REST payload; mutated in place.
+     * @return {Object}
+     */
+    function mergeIntoCachedPost(postId, data) {
+        var cached = LPB.posts[postId] && LPB.posts[postId].custom_meta;
+
+        data.custom_meta = Object.assign({}, cached || {}, data.custom_meta || {});
+
+        return data;
     }
 
     /**
@@ -97,8 +153,13 @@
 
         var alreadyCached = Object.keys(LPB.postMetaKeys[postId] || {});
         var keysToRequest = normalizeMetaKeys(alreadyCached.concat(metaKeys));
+        var requestKey    = postId + '|' + keysToRequest.slice().sort().join(',');
 
-        return fetch(buildPostUrl(postId, keysToRequest), {
+        if (inFlightRequests[requestKey]) {
+            return inFlightRequests[requestKey];
+        }
+
+        var request = fetch(buildPostUrl(postId, keysToRequest), {
             method:  'GET',
             headers: {
                 'X-WP-Nonce':   LPB.nonce,
@@ -112,9 +173,7 @@
                 return response.json();
             })
             .then(function (data) {
-                if (LPB.posts[postId] && LPB.posts[postId].custom_meta && data.custom_meta) {
-                    data.custom_meta = Object.assign({}, LPB.posts[postId].custom_meta, data.custom_meta);
-                }
+                mergeIntoCachedPost(postId, data);
 
                 LPB.posts[postId] = data;
                 rememberMetaKeys(postId, keysToRequest);
@@ -124,7 +183,15 @@
             .catch(function (err) {
                 console.error(err);
                 return null;
+            })
+            .then(function (result) {
+                delete inFlightRequests[requestKey];
+                return result;
             });
+
+        inFlightRequests[requestKey] = request;
+
+        return request;
     }
 
     // ── Popup open ────────────────────────────────────────────────────────────────
@@ -199,13 +266,20 @@
      *
      * @param {Element} container  The popup DOM node.
      * @param {Object}  postData   Payload from the REST endpoint.
+     * @param {number}  postId     Post the payload belongs to; identifies which of
+     *                             its custom meta keys have actually been loaded.
      */
-    function fillFields(container, postData) {
+    function fillFields(container, postData, postId) {
         var fields = container.querySelectorAll(bindingSelector);
 
         fields.forEach(function (el) {
             var binding = getBinding(el);
             if (!binding) { return; }
+
+            // Unknown is not empty: a meta key this payload never requested is left
+            // exactly as it is, so a narrower pass cannot blank a field a wider one
+            // already filled. See isUnloadedMetaBinding().
+            if (isUnloadedMetaBinding(binding, postId)) { return; }
 
             if (binding.target === 'url') {
                 fillUrlBinding(el, binding, postData);
@@ -243,8 +317,8 @@
             }
         });
 
-        fillFormBindings(container, postData);
-        fillChoiceFieldsByMarkers(container, postData);
+        fillFormBindings(container, postData, postId);
+        fillChoiceFieldsByMarkers(container, postData, postId);
     }
 
     /**
@@ -255,12 +329,14 @@
      *
      * @param {Element} container  The popup DOM node.
      * @param {Object}  postData   Payload from the REST endpoint.
+     * @param {number}  postId     Post the payload belongs to.
      */
-    function fillFormBindings(container, postData) {
+    function fillFormBindings(container, postData, postId) {
         container.querySelectorAll('input:not([type="radio"]):not([type="checkbox"]), textarea').forEach(function (el) {
             var attrValue = el.tagName === 'TEXTAREA' ? el.defaultValue : el.getAttribute('value');
             var marker = parseFormValueMarker(attrValue);
             if (!marker) { return; }
+            if (isUnloadedMetaBinding(marker, postId)) { return; }
 
             var resolved = normalizeResolvedValue(
                 resolveBindingValue(marker, postData, 'text'),
@@ -443,8 +519,9 @@
      *
      * @param {Element} container  The popup DOM node.
      * @param {Object}  postData   Payload from the REST endpoint.
+     * @param {number}  postId     Post the payload belongs to.
      */
-    function fillChoiceFieldsByMarkers(container, postData) {
+    function fillChoiceFieldsByMarkers(container, postData, postId) {
 
         // Lazily pick up any markers not yet moved by initChoiceFieldMarkers,
         // including Elementor-split markers (see moveChoiceMarkersToParent).
@@ -454,6 +531,7 @@
         container.querySelectorAll('select[data-lpb-marker]').forEach(function (selectEl) {
             var marker = parseFormChoiceMarker(selectEl.getAttribute('data-lpb-marker'), 'lpb-bind-select:');
             if (!marker) { return; }
+            if (isUnloadedMetaBinding(marker, postId)) { return; }
 
             var rawValue   = resolveBindingValue(marker, postData, 'text');
             var isFallback = marker.fallback !== '' &&
@@ -498,6 +576,7 @@
             var marker   = parseFormChoiceMarker(subgroup.getAttribute('data-lpb-marker'), 'lpb-bind-radio:');
             var nameAttr = subgroup.getAttribute('data-lpb-name') || '';
             if (!marker || !nameAttr) { return; }
+            if (isUnloadedMetaBinding(marker, postId)) { return; }
 
             var items = resolveToOptionItems(resolveBindingValue(marker, postData, 'text'), marker.fallback);
 
@@ -919,37 +998,61 @@
     }
 
     /**
+     * Ticket of the newest population request per popup ID.
+     *
+     * A population request never carries a payload snapshot with it, and a retry it
+     * scheduled aborts as soon as a newer request has taken a ticket for the same
+     * popup. Together those two rules make it impossible for a delayed pass to write
+     * older data over a newer hydration — the failure this replaces, where a 150 ms
+     * retry closed over the pre-open payload and ran after the popup-show pass had
+     * already filled the popup from a complete one.
+     *
+     * @type {Object<string, number>}
+     */
+    var populateTickets = {};
+    var populateSequence = 0;
+
+    /**
      * Top-level populate call. Fills the bindings of the requested popup only.
      * When that popup's wrapper does not exist yet (it is still opening), retries
      * once after 150 ms — no other popup is ever populated instead.
      *
-     * @param {Object} postData
+     * The payload is read out of LPB.posts at fill time rather than passed in, so a
+     * pass always writes the most complete data known at the moment it runs. The
+     * cache only ever gains meta keys (see mergeIntoCachedPost), which is what makes
+     * "latest wins" safe regardless of which REST response landed first.
+     *
      * @param {number} popupId
-     * @param {number} [postId]  When given, population is skipped once the user has
-     *                           selected a different post or popup.
+     * @param {number} postId   Population is skipped once the user has selected a
+     *                          different post or popup.
      */
-    function populatePopupFields(postData, popupId, postId) {
-        if (!postData) { return; }
+    function populatePopupFields(popupId, postId) {
+        if (!isActiveContext(postId, popupId)) { return; }
 
-        var isStale = function () {
-            return typeof postId !== 'undefined' && !isActiveContext(postId, popupId);
+        var ticket = ++populateSequence;
+
+        populateTickets[popupId] = ticket;
+
+        var attempt = function () {
+            var postData  = LPB.posts[postId];
+            var container = getPopupContainer(popupId);
+
+            if (!postData || !container) { return false; }
+
+            fillFields(container, postData, postId);
+
+            return true;
         };
 
-        if (isStale()) { return; }
+        if (attempt()) { return; }
 
-        var container = getPopupContainer(popupId);
-
-        if (container) {
-            fillFields(container, postData);
-            return;
-        }
-
-        // Wrapper not created yet — retry once after a short delay.
+        // Wrapper or payload not there yet — retry once after a short delay, unless a
+        // newer request superseded this one or the selection moved on meanwhile.
         setTimeout(function () {
-            var retryContainer = getPopupContainer(popupId);
-            if (retryContainer && !isStale()) {
-                fillFields(retryContainer, postData);
-            }
+            if (populateTickets[popupId] !== ticket) { return; }
+            if (!isActiveContext(postId, popupId)) { return; }
+
+            attempt();
         }, 150);
     }
 
@@ -980,27 +1083,35 @@
                 LPB.activePostId  = postId;
                 LPB.activePopupId = popupId;
 
-                var metaKeys = collectRequiredMetaKeys(popupId);
-
-                fetchPostData(postId, metaKeys).then(function (postData) {
+                fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (postData) {
                     if (postData) {
                         document.dispatchEvent(new CustomEvent('lpb:item-selected', {
                             bubbles: true,
                             detail: { postId: postId, popupId: popupId, post: postData }
                         }));
-
-                        populatePopupFields(postData, popupId, postId);
                     }
 
+                    // Deliberately no population before the popup opens. Pre-open there
+                    // is nothing to fill and nothing to read: on a first open the wrapper
+                    // does not exist, and on a re-open it is an empty shell until Elementor
+                    // clones fresh content into it — so collectRequiredMetaKeys() cannot
+                    // see this popup's meta keys either, and the only payload available is
+                    // one that never requested them. Hydration belongs after the show
+                    // notification, where the real bindings are readable.
                     return openElementorPopup(popupId).then(function () {
                         return postData;
                     });
                 }).then(function (postData) {
-                    if (postData) {
-                        return fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (freshPostData) {
-                            populatePopupFields(freshPostData || postData, popupId, postId);
-                        });
-                    }
+                    if (!postData) { return; }
+
+                    // Backstop for builds that never emit elementor/popup/show: the popup
+                    // content is in the DOM by now, so its meta keys are readable here too.
+                    // Requesting the same keys as the show path is coalesced into a single
+                    // request, and populatePopupFields() reads the cache at fill time, so
+                    // whichever of the two runs last cannot downgrade the other's work.
+                    return fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function () {
+                        populatePopupFields(popupId, postId);
+                    });
                 });
             });
         });
@@ -1049,10 +1160,8 @@
 
         var postId = LPB.activePostId;
 
-        fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (postData) {
-            if (postData) {
-                populatePopupFields(postData, popupId, postId);
-            }
+        fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function () {
+            populatePopupFields(popupId, postId);
         });
     }
 

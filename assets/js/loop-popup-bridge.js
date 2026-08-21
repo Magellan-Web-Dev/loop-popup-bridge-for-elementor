@@ -255,6 +255,30 @@
         return popupId ? document.getElementById('elementor-popup-modal-' + popupId) : null;
     }
 
+    /**
+     * Same lookup as getPopupContainer(), but only returns the wrapper once the
+     * popup's own content is actually inside it.
+     *
+     * The wrapper survives a close; the Elementor document Elementor clones into it
+     * does not. A bare wrapper therefore says nothing about this popup's bindings,
+     * and collectRequiredMetaKeys() would report "no custom meta keys" for a popup
+     * that has plenty — the same false-empty answer as having no wrapper at all.
+     * Readiness is what makes an empty key list authoritative, so every path that
+     * decides "this popup needs nothing more" must go through here.
+     *
+     * @param  {number} popupId
+     * @return {Element|null}
+     */
+    function getReadyPopupContainer(popupId) {
+        var container = getPopupContainer(popupId);
+
+        if (!container) {
+            return null;
+        }
+
+        return container.querySelector('[data-elementor-type="popup"], .elementor') ? container : null;
+    }
+
     var bindingSelector = [
         '[data-lpb-field]',
         'a[href*="lpb-field="]',
@@ -997,6 +1021,133 @@
         return LPB.activePostId === postId && LPB.activePopupId === popupId;
     }
 
+    // ── Selection lifecycle ───────────────────────────────────────────────────────
+
+    /**
+     * Every accepted trigger click takes the next selection token. The token is the
+     * only thing that distinguishes two clicks on the *same* item, which (postId,
+     * popupId) alone cannot, so it is what lets a callback tell "I am still the
+     * current selection" from "a newer click already took over".
+     */
+    var selectionSequence        = 0;
+    var activeSelectionToken     = 0;
+    var dispatchedSelectionToken = 0;
+
+    /**
+     * The hydration in progress for `hydrationToken`, or null.
+     *
+     * The popup-show notification and the post-open backstop both try to hydrate the
+     * same selection; memoising the promise makes the second caller join the first
+     * instead of starting a parallel run, which is what makes one click produce one
+     * `lpb:item-selected` no matter which path arrived first.
+     */
+    var hydrationToken   = 0;
+    var hydrationPromise = null;
+
+    /** Interval and ceiling for the backstop's wait on the popup becoming readable. */
+    var POPUP_READY_RETRY_MS    = 60;
+    var POPUP_READY_MAX_RETRIES = 20;
+
+    /**
+     * True while (postId, popupId, token) is still the selection the user last made.
+     * Checked after every await so a slow response for an older click can neither
+     * fill fields nor announce itself.
+     */
+    function isCurrentSelection(postId, popupId, token) {
+        return isActiveContext(postId, popupId) && token === activeSelectionToken;
+    }
+
+    /**
+     * Announces the completed selection exactly once per click.
+     *
+     * Public contract, unchanged: `lpb:item-selected` on document, bubbling, with
+     * detail {postId, popupId, post}. It is emitted only from here, and only from
+     * the end of a hydration that ran against the real popup DOM, so `post` always
+     * carries the custom_meta that popup's bindings asked for.
+     */
+    function dispatchSelectionEvent(postId, popupId, token, postData) {
+        if (dispatchedSelectionToken === token) { return; }
+
+        dispatchedSelectionToken = token;
+
+        document.dispatchEvent(new CustomEvent('lpb:item-selected', {
+            bubbles: true,
+            detail: { postId: postId, popupId: popupId, post: postData }
+        }));
+    }
+
+    /**
+     * The single completion path for a selection: read the popup's real bindings,
+     * request everything they need, fill the popup, then announce it.
+     *
+     * Requires a *ready* popup container. Until the popup's own content exists its
+     * meta keys are unknowable, and an event sent then would be the partial payload
+     * this whole path exists to avoid — so this returns null and leaves the retry to
+     * whichever caller comes back later.
+     *
+     * The payload announced is read from the cache at completion time (which only
+     * ever gains meta keys, see mergeIntoCachedPost) rather than from a snapshot
+     * taken earlier, so it is the most complete data known for the post.
+     *
+     * @param  {number} postId
+     * @param  {number} popupId
+     * @param  {number} token    Selection token of the click being finalised.
+     * @return {Promise|null}    The shared hydration, or null if it cannot start yet.
+     */
+    function hydrateAndFinalizeSelection(postId, popupId, token) {
+        if (!isCurrentSelection(postId, popupId, token)) { return null; }
+
+        if (hydrationPromise && hydrationToken === token) {
+            return hydrationPromise;
+        }
+
+        if (!getReadyPopupContainer(popupId)) { return null; }
+
+        hydrationToken   = token;
+        hydrationPromise = fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (postData) {
+            if (!isCurrentSelection(postId, popupId, token)) { return; }
+
+            populatePopupFields(popupId, postId);
+
+            if (!postData) {
+                // The request failed (fetchPostData already logged it). Stay silent
+                // rather than announce a payload missing the keys we just asked for,
+                // and drop the memo so a later notification can retry.
+                if (hydrationToken === token) { hydrationPromise = null; }
+                return;
+            }
+
+            dispatchSelectionEvent(postId, popupId, token, LPB.posts[postId] || postData);
+        });
+
+        return hydrationPromise;
+    }
+
+    /**
+     * Backstop for builds that never emit `elementor/popup/show`: waits for the
+     * popup to become readable, then runs the same completion path the show handler
+     * runs. Polling instead of trusting one fixed delay means a slow open still
+     * finalises, and a popup that never opens finalises nothing rather than emitting
+     * an event built from bindings that were never there.
+     */
+    function finalizeWhenPopupReady(postId, popupId, token, attempt) {
+        if (!isCurrentSelection(postId, popupId, token)) { return; }
+        if (dispatchedSelectionToken === token) { return; }
+
+        if (hydrateAndFinalizeSelection(postId, popupId, token)) { return; }
+
+        if (attempt >= POPUP_READY_MAX_RETRIES) {
+            console.warn(
+                'LPB: popup ' + popupId + ' never became readable — lpb:item-selected not dispatched for post ' + postId + '.'
+            );
+            return;
+        }
+
+        setTimeout(function () {
+            finalizeWhenPopupReady(postId, popupId, token, attempt + 1);
+        }, POPUP_READY_RETRY_MS);
+    }
+
     /**
      * Ticket of the newest population request per popup ID.
      *
@@ -1080,38 +1231,32 @@
 
         requestAnimationFrame(function () {
             requestAnimationFrame(function () {
-                LPB.activePostId  = postId;
-                LPB.activePopupId = popupId;
+                var token = ++selectionSequence;
 
-                fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (postData) {
-                    if (postData) {
-                        document.dispatchEvent(new CustomEvent('lpb:item-selected', {
-                            bubbles: true,
-                            detail: { postId: postId, popupId: popupId, post: postData }
-                        }));
-                    }
+                LPB.activePostId     = postId;
+                LPB.activePopupId    = popupId;
+                activeSelectionToken = token;
 
-                    // Deliberately no population before the popup opens. Pre-open there
-                    // is nothing to fill and nothing to read: on a first open the wrapper
-                    // does not exist, and on a re-open it is an empty shell until Elementor
-                    // clones fresh content into it — so collectRequiredMetaKeys() cannot
-                    // see this popup's meta keys either, and the only payload available is
-                    // one that never requested them. Hydration belongs after the show
-                    // notification, where the real bindings are readable.
-                    return openElementorPopup(popupId).then(function () {
-                        return postData;
-                    });
-                }).then(function (postData) {
-                    if (!postData) { return; }
+                // Abandon any hydration the previous selection memoised: its callbacks
+                // now fail isCurrentSelection() and must not be joined by this click.
+                hydrationToken   = 0;
+                hydrationPromise = null;
 
-                    // Backstop for builds that never emit elementor/popup/show: the popup
-                    // content is in the DOM by now, so its meta keys are readable here too.
-                    // Requesting the same keys as the show path is coalesced into a single
-                    // request, and populatePopupFields() reads the cache at fill time, so
-                    // whichever of the two runs last cannot downgrade the other's work.
-                    return fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function () {
-                        populatePopupFields(popupId, postId);
-                    });
+                // Warms the base payload while the popup opens — and nothing more.
+                // Pre-open there is nothing to fill and nothing to read: on a first open
+                // the wrapper does not exist, and on a re-open it is an empty shell until
+                // Elementor clones fresh content into it — so collectRequiredMetaKeys()
+                // cannot see this popup's meta keys either. Announcing the selection here
+                // is exactly the partial-payload bug this ordering removes; the event is
+                // dispatched from hydrateAndFinalizeSelection() once the real bindings
+                // have been read and served.
+                fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function () {
+                    // Opening does not depend on the warm-up succeeding.
+                    return openElementorPopup(popupId);
+                }, function () {
+                    return openElementorPopup(popupId);
+                }).then(function () {
+                    finalizeWhenPopupReady(postId, popupId, token, 0);
                 });
             });
         });
@@ -1158,11 +1303,10 @@
             return; // Not our popup or no active post — leave it alone.
         }
 
-        var postId = LPB.activePostId;
-
-        fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function () {
-            populatePopupFields(popupId, postId);
-        });
+        // Same completion path as the post-open backstop, joined rather than repeated:
+        // whichever arrives first owns the hydration, and only one lpb:item-selected
+        // is dispatched for this click.
+        hydrateAndFinalizeSelection(LPB.activePostId, popupId, activeSelectionToken);
     }
 
     // ── Preload support ───────────────────────────────────────────────────────────

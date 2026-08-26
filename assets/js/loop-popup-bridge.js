@@ -23,12 +23,14 @@
         activePopupId: null,
         posts:         {},
         postMetaKeys:  {},
+        popupMetaKeys: {},
         restUrl:       '',
         nonce:         '',
     };
 
     var LPB = window.LoopPopupBridge;
-    LPB.postMetaKeys = LPB.postMetaKeys || {};
+    LPB.postMetaKeys  = LPB.postMetaKeys  || {};
+    LPB.popupMetaKeys = LPB.popupMetaKeys || {};
 
     // ── REST fetch with client-side cache ─────────────────────────────────────────
 
@@ -93,15 +95,27 @@
         return !(LPB.postMetaKeys[postId] || {})[binding.metaKey];
     }
 
-    /** Builds the REST URL, including requested meta keys when needed. */
-    function buildPostUrl(postId, metaKeys) {
-        var url = LPB.restUrl + postId;
+    /**
+     * Builds the REST URL, including requested meta keys and the popup to resolve.
+     *
+     * Passing popup_id asks the server to add whatever meta keys that popup binds,
+     * read from its saved Elementor data. That matters for a trigger that was not
+     * on the page at render time (Loop Grid infinite scroll), where the client has
+     * no preloaded key list and cannot read the popup's DOM either.
+     */
+    function buildPostUrl(postId, metaKeys, popupId) {
+        var url    = LPB.restUrl + postId;
+        var params = [];
 
         if (metaKeys.length) {
-            url += '?meta_keys=' + encodeURIComponent(metaKeys.join(','));
+            params.push('meta_keys=' + encodeURIComponent(metaKeys.join(',')));
         }
 
-        return url;
+        if (popupId) {
+            params.push('popup_id=' + encodeURIComponent(popupId));
+        }
+
+        return params.length ? url + '?' + params.join('&') : url;
     }
 
     /**
@@ -137,29 +151,40 @@
 
     /**
      * Returns a Promise that resolves to the post data object.
-     * Results are cached in LPB.posts keyed by post ID so subsequent clicks on the
-     * same post skip the network round-trip entirely.
+     *
+     * On a normal page load nothing gets here: PHP renders the payload for every
+     * trigger inline, so LPB.posts is already complete and every call is a cache
+     * hit. What still reaches the network is a trigger the page could not know
+     * about at render time — anything inserted later by AJAX.
      *
      * @param  {number} postId
      * @param  {Array<string>} metaKeys
+     * @param  {number} [popupId]  Popup whose bindings the server should resolve.
      * @return {Promise<Object|null>}
      */
-    function fetchPostData(postId, metaKeys) {
+    function fetchPostData(postId, metaKeys, popupId) {
         metaKeys = normalizeMetaKeys(metaKeys);
+        popupId  = parseInt(popupId, 10) || 0;
 
-        if (hasCachedMetaKeys(postId, metaKeys)) {
+        // An unresolved popup is the one case where the cache cannot answer for
+        // itself: metaKeys is empty only because nobody knows what this popup needs
+        // yet, so a cache "hit" here would lock in that ignorance permanently. Let
+        // the request through once and the server fills in the key list.
+        var popupResolved = !popupId || !!LPB.popupMetaKeys[popupId];
+
+        if (popupResolved && hasCachedMetaKeys(postId, metaKeys)) {
             return Promise.resolve(LPB.posts[postId]);
         }
 
         var alreadyCached = Object.keys(LPB.postMetaKeys[postId] || {});
         var keysToRequest = normalizeMetaKeys(alreadyCached.concat(metaKeys));
-        var requestKey    = postId + '|' + keysToRequest.slice().sort().join(',');
+        var requestKey    = postId + '|' + popupId + '|' + keysToRequest.slice().sort().join(',');
 
         if (inFlightRequests[requestKey]) {
             return inFlightRequests[requestKey];
         }
 
-        var request = fetch(buildPostUrl(postId, keysToRequest), {
+        var request = fetch(buildPostUrl(postId, keysToRequest, popupId), {
             method:  'GET',
             headers: {
                 'X-WP-Nonce':   LPB.nonce,
@@ -176,7 +201,18 @@
                 mergeIntoCachedPost(postId, data);
 
                 LPB.posts[postId] = data;
-                rememberMetaKeys(postId, keysToRequest);
+
+                // meta_keys_loaded is what the server actually resolved, which is a
+                // superset of what we asked for whenever popup_id widened it. Both
+                // are recorded: the union is the set that no longer needs asking for.
+                rememberMetaKeys(postId, keysToRequest.concat(data.meta_keys_loaded || []));
+
+                // popup_meta_keys is this popup's own bindings; meta_keys_loaded is
+                // the wider union this request happened to cover. Only the former can
+                // be filed against the popup ID.
+                if (popupId && data.popup_meta_keys) {
+                    LPB.popupMetaKeys[popupId] = data.popup_meta_keys;
+                }
 
                 return data;
             })
@@ -838,6 +874,30 @@
         return normalizeMetaKeys(keys);
     }
 
+    /**
+     * The meta keys PHP resolved for this popup from its saved Elementor data.
+     *
+     * This is the answer collectRequiredMetaKeys() cannot give before a popup's
+     * first open, and the reason the preload works at all now.
+     */
+    function serverMetaKeys(popupId) {
+        return LPB.popupMetaKeys[parseInt(popupId, 10)] || [];
+    }
+
+    /**
+     * Everything a popup needs: what the server resolved, plus whatever its DOM
+     * reveals once it exists.
+     *
+     * Neither source alone is sufficient. The DOM scan is blind until the first
+     * open, and the server scan cannot see bindings that live in another document
+     * (global widgets, shortcode-rendered templates). The union means a gap in
+     * either one is covered by the other, and the DOM scan's deliberate "return
+     * nothing rather than read the wrong popup" behaviour costs nothing.
+     */
+    function requiredMetaKeys(popupId) {
+        return normalizeMetaKeys(serverMetaKeys(popupId).concat(collectRequiredMetaKeys(popupId)));
+    }
+
     /** Sets textContent; falls back to data-lpb-fallback if value is empty. */
     function fillTextField(el, value) {
         value = normalizeResolvedValue(value, 'text');
@@ -1058,12 +1118,28 @@
     }
 
     /**
-     * Announces the completed selection exactly once per click.
+     * Announces the selection exactly once per click.
      *
-     * Public contract, unchanged: `lpb:item-selected` on document, bubbling, with
-     * detail {postId, popupId, post}. It is emitted only from here, and only from
-     * the end of a hydration that ran against the real popup DOM, so `post` always
-     * carries the custom_meta that popup's bindings asked for.
+     * Public contract: `lpb:item-selected` on document, bubbling, with detail
+     * {postId, popupId, post}. It is emitted only from here.
+     *
+     * This used to be dispatched at the end of a hydration that had read the real
+     * popup DOM, because that was the earliest moment the payload was known to be
+     * complete — before the popup existed, custom_meta was necessarily empty. Now
+     * that the popup's meta keys come from its saved data, completeness can be
+     * established at click time, so the event fires from the click path instead and
+     * arrives before the popup opens rather than after.
+     *
+     * Three consequences worth knowing:
+     *  - A listener that reaches into the popup DOM must use `elementor/popup/show`
+     *    instead; there is nothing to read yet when this fires.
+     *  - `post.custom_meta` carries the union of the keys of every popup this post
+     *    triggers on the page, so it can be wider than any single popup uses.
+     *  - Two rapid clicks on different items now produce two events. Announcing at
+     *    click time cannot do otherwise: coalescing them would mean waiting to find
+     *    out whether a later click is coming, which is the wait that was removed.
+     *    Each event still carries only its own item's data, and only the last click
+     *    owns the active context, so only its popup is filled.
      */
     function dispatchSelectionEvent(postId, popupId, token, postData) {
         if (dispatchedSelectionToken === token) { return; }
@@ -1077,24 +1153,24 @@
     }
 
     /**
-     * The single completion path for a selection: read the popup's real bindings,
-     * request everything they need, fill the popup, then announce it.
+     * Fills the popup once its own content is in the DOM.
      *
-     * Requires a *ready* popup container. Until the popup's own content exists its
-     * meta keys are unknowable, and an event sent then would be the partial payload
-     * this whole path exists to avoid — so this returns null and leaves the retry to
-     * whichever caller comes back later.
+     * Requires a *ready* popup container, because filling genuinely needs elements
+     * to write into — unlike the selection event, which no longer waits for this
+     * (see dispatchSelectionEvent). Returns null when the popup is not ready yet and
+     * leaves the retry to whichever caller comes back later.
      *
-     * The payload announced is read from the cache at completion time (which only
-     * ever gains meta keys, see mergeIntoCachedPost) rather than from a snapshot
-     * taken earlier, so it is the most complete data known for the post.
+     * The keys requiredMetaKeys() asks for are normally already satisfied by the
+     * preloaded payload, so the fetch resolves from cache without touching the
+     * network. It stays a fetch for the sake of the one thing this pass can still
+     * discover: a binding the server-side scan could not see.
      *
      * @param  {number} postId
      * @param  {number} popupId
-     * @param  {number} token    Selection token of the click being finalised.
+     * @param  {number} token    Selection token of the click being served.
      * @return {Promise|null}    The shared hydration, or null if it cannot start yet.
      */
-    function hydrateAndFinalizeSelection(postId, popupId, token) {
+    function hydratePopupContent(postId, popupId, token) {
         if (!isCurrentSelection(postId, popupId, token)) { return null; }
 
         if (hydrationPromise && hydrationToken === token) {
@@ -1104,19 +1180,23 @@
         if (!getReadyPopupContainer(popupId)) { return null; }
 
         hydrationToken   = token;
-        hydrationPromise = fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function (postData) {
+        hydrationPromise = fetchPostData(postId, requiredMetaKeys(popupId), popupId).then(function (postData) {
             if (!isCurrentSelection(postId, popupId, token)) { return; }
 
             populatePopupFields(popupId, postId);
 
             if (!postData) {
-                // The request failed (fetchPostData already logged it). Stay silent
-                // rather than announce a payload missing the keys we just asked for,
-                // and drop the memo so a later notification can retry.
+                // The request failed (fetchPostData already logged it). Drop the memo
+                // so a later notification can retry.
                 if (hydrationToken === token) { hydrationPromise = null; }
                 return;
             }
 
+            // Safety net, not the normal path: the click already announced this
+            // selection. This only lands if the click could not — a cache miss whose
+            // request was still in flight, or one that failed and later succeeded.
+            // dispatchSelectionEvent is idempotent per token, so when the click did
+            // its job this is a no-op rather than a second event.
             dispatchSelectionEvent(postId, popupId, token, LPB.posts[postId] || postData);
         });
 
@@ -1125,26 +1205,29 @@
 
     /**
      * Backstop for builds that never emit `elementor/popup/show`: waits for the
-     * popup to become readable, then runs the same completion path the show handler
-     * runs. Polling instead of trusting one fixed delay means a slow open still
-     * finalises, and a popup that never opens finalises nothing rather than emitting
-     * an event built from bindings that were never there.
+     * popup to become readable, then runs the same fill the show handler runs.
+     * Polling instead of trusting one fixed delay means a slow open still fills, and
+     * a popup that never opens fills nothing rather than writing into the wrong DOM.
+     *
+     * Note there is deliberately no "already dispatched, so stop" check here. The
+     * click announces the selection immediately now, so such a check would abort the
+     * poll before the popup was ever filled. Dispatch and fill are separate concerns:
+     * this one owns the fill and keeps waiting until the popup can take it.
      */
-    function finalizeWhenPopupReady(postId, popupId, token, attempt) {
+    function fillWhenPopupReady(postId, popupId, token, attempt) {
         if (!isCurrentSelection(postId, popupId, token)) { return; }
-        if (dispatchedSelectionToken === token) { return; }
 
-        if (hydrateAndFinalizeSelection(postId, popupId, token)) { return; }
+        if (hydratePopupContent(postId, popupId, token)) { return; }
 
         if (attempt >= POPUP_READY_MAX_RETRIES) {
             console.warn(
-                'LPB: popup ' + popupId + ' never became readable — lpb:item-selected not dispatched for post ' + postId + '.'
+                'LPB: popup ' + popupId + ' never became readable — fields not populated for post ' + postId + '.'
             );
             return;
         }
 
         setTimeout(function () {
-            finalizeWhenPopupReady(postId, popupId, token, attempt + 1);
+            fillWhenPopupReady(postId, popupId, token, attempt + 1);
         }, POPUP_READY_RETRY_MS);
     }
 
@@ -1229,6 +1312,8 @@
             return;
         }
 
+        // Deferred by two frames so the click animation paints before any of this
+        // runs, including third-party lpb:item-selected listeners.
         requestAnimationFrame(function () {
             requestAnimationFrame(function () {
                 var token = ++selectionSequence;
@@ -1242,22 +1327,37 @@
                 hydrationToken   = 0;
                 hydrationPromise = null;
 
-                // Warms the base payload while the popup opens — and nothing more.
-                // Pre-open there is nothing to fill and nothing to read: on a first open
-                // the wrapper does not exist, and on a re-open it is an empty shell until
-                // Elementor clones fresh content into it — so collectRequiredMetaKeys()
-                // cannot see this popup's meta keys either. Announcing the selection here
-                // is exactly the partial-payload bug this ordering removes; the event is
-                // dispatched from hydrateAndFinalizeSelection() once the real bindings
-                // have been read and served.
-                fetchPostData(postId, collectRequiredMetaKeys(popupId)).then(function () {
-                    // Opening does not depend on the warm-up succeeding.
-                    return openElementorPopup(popupId);
-                }, function () {
-                    return openElementorPopup(popupId);
-                }).then(function () {
-                    finalizeWhenPopupReady(postId, popupId, token, 0);
-                });
+                var metaKeys = requiredMetaKeys(popupId);
+
+                var open = function () {
+                    return openElementorPopup(popupId).then(function () {
+                        fillWhenPopupReady(postId, popupId, token, 0);
+                    });
+                };
+
+                // Announce the selection now rather than after the popup opens.
+                //
+                // This became possible once the popup's meta keys stopped depending on
+                // the popup's DOM: the keys come from its saved data, so "is the payload
+                // complete for this popup" is answerable here — which is exactly what
+                // hasCachedMetaKeys() is being asked. Every trigger the page rendered is
+                // preloaded, so this is the path essentially every click takes, and the
+                // event goes out in this frame with nothing to wait for.
+                if (hasCachedMetaKeys(postId, metaKeys)) {
+                    dispatchSelectionEvent(postId, popupId, token, LPB.posts[postId]);
+                    open();
+                    return;
+                }
+
+                // Only reachable for a trigger the page did not render — inserted by
+                // AJAX and not yet preloaded. Opening waits on the data here, the way
+                // it always did: a popup that opens before its values arrive shows a
+                // flash of fallbacks, which is worse than opening a moment later.
+                fetchPostData(postId, metaKeys, popupId).then(function (postData) {
+                    if (postData && isCurrentSelection(postId, popupId, token)) {
+                        dispatchSelectionEvent(postId, popupId, token, LPB.posts[postId] || postData);
+                    }
+                }).then(open, open);
             });
         });
     }
@@ -1303,27 +1403,67 @@
             return; // Not our popup or no active post — leave it alone.
         }
 
-        // Same completion path as the post-open backstop, joined rather than repeated:
-        // whichever arrives first owns the hydration, and only one lpb:item-selected
-        // is dispatched for this click.
-        hydrateAndFinalizeSelection(LPB.activePostId, popupId, activeSelectionToken);
+        // Same fill path as the post-open backstop, joined rather than repeated:
+        // whichever arrives first owns the hydration.
+        hydratePopupContent(LPB.activePostId, popupId, activeSelectionToken);
     }
 
     // ── Preload support ───────────────────────────────────────────────────────────
 
     /**
-     * If any trigger element has data-lpb-preload="1", fetches its post data
-     * immediately after the page loads so the first click is instant.
+     * Preloads triggers that were not on the page when PHP rendered it.
+     *
+     * Everything present at render time already has its payload inline, so there is
+     * nothing to do on page load. What this covers is markup added afterwards —
+     * Loop Grid infinite scroll and any other AJAX — where the server had no chance
+     * to include the data. Passing the popup ID lets the endpoint resolve that
+     * popup's meta keys itself, which is the only way to get them for a popup the
+     * page never mentioned.
      */
-    function preloadMarkedItems() {
-        var preloads = document.querySelectorAll('[data-lpb-trigger="1"][data-lpb-preload="1"]');
-        preloads.forEach(function (el) {
+    function preloadTriggers(root) {
+        var scope    = root && root.querySelectorAll ? root : document;
+        var triggers = scope.querySelectorAll('[data-lpb-trigger="1"]');
+
+        triggers.forEach(function (el) {
             var postId  = parseInt(el.getAttribute('data-lpb-post-id'), 10);
             var popupId = parseInt(el.getAttribute('data-lpb-popup-id'), 10);
+
             if (postId && !LPB.posts[postId]) {
-                fetchPostData(postId, popupId ? collectRequiredMetaKeys(popupId) : []); // fire-and-forget; result stored in LPB.posts
+                // Fire-and-forget; the result lands in LPB.posts.
+                fetchPostData(postId, requiredMetaKeys(popupId), popupId);
             }
         });
+    }
+
+    /**
+     * Watches for trigger elements arriving after page load and preloads them.
+     *
+     * Elementor exposes no reliable "loop grid appended items" hook across versions,
+     * so this observes the DOM instead. Batched on a microtask because an infinite-
+     * scroll page inserts many items in one burst, and each insertion would
+     * otherwise re-scan.
+     */
+    function watchForNewTriggers() {
+        if (typeof window.MutationObserver === 'undefined') { return; }
+
+        var scheduled = false;
+
+        new MutationObserver(function (mutations) {
+            if (scheduled) { return; }
+
+            var sawElements = mutations.some(function (mutation) {
+                return mutation.addedNodes.length > 0;
+            });
+
+            if (!sawElements) { return; }
+
+            scheduled = true;
+
+            Promise.resolve().then(function () {
+                scheduled = false;
+                preloadTriggers(document);
+            });
+        }).observe(document.body, { childList: true, subtree: true });
     }
 
     // ── Initialisation ────────────────────────────────────────────────────────────
@@ -1366,7 +1506,10 @@
             );
         }
 
-        preloadMarkedItems();
+        // Normally a no-op: PHP rendered every trigger's payload into the page. This
+        // only picks up anything the inline payload had to skip.
+        preloadTriggers(document);
+        watchForNewTriggers();
     }
 
     // Run after DOM is ready; elementor-frontend.js (our dependency) is already parsed.

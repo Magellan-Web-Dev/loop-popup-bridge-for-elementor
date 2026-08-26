@@ -60,12 +60,74 @@ ACF fields are discovered automatically and grouped in the dynamic tag controls 
 
 ### 3. Click → Populate → Open
 
-When a visitor clicks a trigger widget:
+Post data is **always preloaded**, for every trigger, with no setting to configure. On page render, PHP works out which meta keys each popup binds by reading that popup's saved Elementor data, then prints the complete payload for every trigger into the footer:
+
+```js
+window.LoopPopupBridge.posts          // { [postId]: postData }  — full, including custom_meta
+window.LoopPopupBridge.postMetaKeys   // { [postId]: { [key]: true } }  — what has been resolved
+window.LoopPopupBridge.popupMetaKeys  // { [popupId]: [key, …] }  — what each popup binds
+```
+
+So when a visitor clicks a trigger widget:
 
 1. JavaScript reads the `data-lpb-post-id` and `data-lpb-popup-id` attributes on the wrapper.
-2. Post data is fetched from the plugin's public read-only REST endpoint (`/wp-json/loop-popup-bridge/v1/post/{id}`). Results are cached in memory so repeated clicks on the same post avoid repeated network requests.
+2. `lpb:item-selected` is dispatched with the complete payload — **no network request**, and before the popup opens.
 3. The Elementor Pro popup is opened via `elementorProFrontend.modules.popup.showPopup()`.
-4. Every `[data-lpb-field]` placeholder inside the popup is replaced with the matching field value from the REST response.
+4. Every `[data-lpb-field]` placeholder inside the popup is replaced with the matching field value.
+
+The REST endpoint is only reached for a trigger the page could not know about at render time — one inserted afterwards by Loop Grid infinite scroll or other AJAX. Those are preloaded too, by a `MutationObserver` that requests them as they appear.
+
+**Why the server has to resolve the meta keys.** Elementor Pro removes a popup's document from the page on init and keeps it as an HTML string until the popup's first open. Nothing client-side can read a popup's bindings before then — which is why preloading used to fetch every post with an empty `custom_meta` and only fill it in after a click. Reading the popup's saved data server-side is the only place that answer exists ahead of the first open.
+
+**Two blind spots**, both of which degrade to the old behaviour rather than breaking: bindings that live in another document the scan cannot follow (global widgets, shortcode-rendered templates — plain **Template** widgets *are* followed), and keys injected at runtime by third-party code. The popup-show pass still reads the real DOM and fills anything missed a moment later. Use `lpb_popup_meta_keys` to have such keys preloaded anyway:
+
+```php
+add_filter('lpb_popup_meta_keys', function (array $keys, int $popup_id): array {
+    if (1234 === $popup_id) {
+        $keys[] = 'key_inside_a_global_widget';
+    }
+    return $keys;
+}, 10, 2);
+```
+
+**Page weight.** The payload is in the HTML now, and `content` is by far the largest field. Trim what your popups do not bind:
+
+```php
+add_filter('lpb_preload_fields', fn(array $fields): array => array_diff($fields, ['content']));
+```
+
+Only trim a field no binding reads. A complete client-side cache is never refetched, so a field removed here is a field the popup cannot fill. `id`, `custom_meta` and `meta_keys_loaded` are structural and cannot be trimmed.
+
+**Full-page caches** now serve the preloaded data along with the page, so it goes stale like any other cached markup. Purging on post save — which most caching plugins do by default — covers the normal case.
+
+---
+
+## The `lpb:item-selected` Event
+
+Dispatched on `document`, bubbling, once per click:
+
+```js
+document.addEventListener('lpb:item-selected', function (event) {
+    var postId  = event.detail.postId;
+    var popupId = event.detail.popupId;
+    var post    = event.detail.post;   // the same object as LoopPopupBridge.posts[postId]
+
+    console.log(post.title, post.custom_meta);
+});
+```
+
+It fires roughly two animation frames after the click, **before the popup opens**, with `custom_meta` already complete. Two frames because the click animation is allowed to paint first — a slow listener slows the event, never the animation.
+
+> **Changed behaviour.** This event used to fire *after* the popup had opened and been filled, because before the popup existed its meta keys were unknowable and the payload would have been incomplete. It now fires from the click instead.
+>
+> - A listener that only reads `event.detail` needs no change, and gets its data sooner.
+> - **A listener that reaches into the popup DOM must move to `elementor/popup/show`** — there is nothing to read when this fires.
+
+`post.custom_meta` carries the union of the keys of every popup that post triggers on the page, so it can be wider than the popup being opened actually uses.
+
+Exactly one event is dispatched **per click**. Note the shift: when the event fired after popup-open, two rapid clicks on different items produced a single event for the item that won. Announcing at click time cannot coalesce that way — doing so would mean waiting to find out whether a later click is coming, which is the wait that was removed. So two rapid clicks now yield two events. If your listener counts selections, de-duplicate on `postId`.
+
+What is still guaranteed: each event carries only its own item's data, and only the last click owns the active context, so only that popup is filled.
 
 ---
 
@@ -81,7 +143,8 @@ loop-popup-bridge-for-elementor/
 │   ├── Controls/
 │   │   └── WidgetControlsManager.php     Injects Loop Popup Bridge controls into legacy and atomic widgets
 │   ├── Frontend/
-│   │   └── FrontendManager.php           Writes data-lpb-* attributes at render time; enqueues JS
+│   │   └── FrontendManager.php           Writes data-lpb-* attributes at render time; enqueues JS;
+│   │                                     renders the inline preload payload in the footer
 │   ├── DynamicTags/
 │   │   ├── DynamicTagsManager.php        Registers all four dynamic tags with Elementor Pro
 │   │   ├── ClickedPostFieldTag.php       Inline HTML span placeholder for text/HTML fields
@@ -91,7 +154,9 @@ loop-popup-bridge-for-elementor/
 │   ├── REST/
 │   │   └── PostEndpoint.php              GET /wp-json/loop-popup-bridge/v1/post/{id}
 │   ├── Support/
-│   │   └── FieldRegistry.php             Shared field options, ACF discovery, binding helpers, meta allowlist
+│   │   ├── FieldRegistry.php             Shared field options, ACF discovery, binding helpers, meta allowlist
+│   │   ├── PopupBindingScanner.php       Resolves a popup's bound meta keys from its saved Elementor data
+│   │   └── PostPayload.php               Access checks + the sanitised payload, shared by inline and REST
 │   └── Updates/
 │       └── GitHubUpdater.php             GitHub release checks and update package handling
 ├── assets/
@@ -110,7 +175,8 @@ loop-popup-bridge-for-elementor/
 |---|---|---|
 | **Enable Loop Popup Trigger** | Toggle | Marks this widget as a click trigger |
 | **Popup** | Select (searchable) | The Elementor Pro popup to open on click |
-| **Preload Post Data** | Toggle | Fetches post data on page load so the first click is instant |
+
+There is no preload control. Post data is preloaded for every trigger, always. The old **Preload Post Data** toggle was not a real choice: switched off, the first click paid for a round-trip; switched on, the preload could not discover the popup's meta keys, so it fetched an empty `custom_meta` either way. Resolving the keys server-side removed the reason for the setting.
 
 ---
 
@@ -120,13 +186,16 @@ loop-popup-bridge-for-elementor/
 GET /wp-json/loop-popup-bridge/v1/post/{id}
 ```
 
+Most page loads never touch this route — the payload is rendered inline. It serves triggers added after render (infinite scroll and other AJAX).
+
 - **Authentication:** None required. This is a public read-only endpoint for publicly available content.
 - **Access checks:** The post must exist, have `publish` status, not be password-protected, and belong to a public post type.
 - **Custom meta:** Callers request specific keys with `?meta_keys=key1,key2`. The endpoint returns only requested keys that are allowlisted server-side.
+- **Popup resolution:** `?popup_id=123` adds whatever meta keys that popup binds, resolved from its saved Elementor data. This lets a caller that has never opened the popup still ask for the right keys. Only an `elementor_library` post whose template type is `popup` is accepted; anything else resolves to no keys. This widens what is *requested* — the allowlist gate on what may be *returned* is unaffected.
 - **ACF fields:** Registered ACF fields are automatically included in the allowlist so popup bindings work without extra configuration.
 - **Manual meta keys:** Non-ACF keys must be added through the `lpb_allowed_meta_keys` filter.
 
-**Example response:**
+**Example response** for `?popup_id=123`:
 
 ```json
 {
@@ -142,9 +211,14 @@ GET /wp-json/loop-popup-bridge/v1/post/{id}
   "featured_image_alt": "Hero image alt text",
   "custom_meta": {
     "event_date": "2025-06-01"
-  }
+  },
+  "meta_keys_loaded": ["event_date"],
+  "popup_meta_keys": ["event_date"]
 }
 ```
+
+- `meta_keys_loaded` — every key this response resolved, **before** the allowlist. A key listed here with no entry in `custom_meta` was asked for and came back empty, which is different from never having been asked: the frontend renders the binding's configured fallback rather than waiting for data that will never arrive.
+- `popup_meta_keys` — present only when `popup_id` was passed. Just that popup's own bindings, which is narrower than `meta_keys_loaded` whenever the request also carried keys for something else.
 
 **Exposing manual custom meta fields:**
 

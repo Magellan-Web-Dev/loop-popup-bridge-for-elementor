@@ -8,6 +8,8 @@ if (!defined('ABSPATH')) exit;
 
 use Elementor\Element_Base;
 use Elementor\Widget_Base;
+use LoopPopupBridge\Support\PopupBindingScanner;
+use LoopPopupBridge\Support\PostPayload;
 
 /**
  * Handles all frontend responsibilities for the Loop Popup Bridge plugin.
@@ -17,6 +19,8 @@ use Elementor\Widget_Base;
  *     "Enable Loop Popup Trigger" control is turned on.
  *  2. Enqueues the JavaScript bundle and injects the global context object
  *     (window.LoopPopupBridge) with the REST URL and nonce.
+ *  3. Renders the full data payload for every trigger on the page inline, so the
+ *     frontend never has to fetch anything before the first click.
  *
  * The data-lpb-post-id attribute is populated from get_the_ID() at render
  * time. Inside an Elementor Loop Grid this correctly returns the post ID of
@@ -31,9 +35,20 @@ final class FrontendManager
      * sufficient even when multiple LPB-enabled atomic widgets appear in the same loop
      * item. Each entry is pushed in the before_render action and popped in after_render.
      *
-     * @var array<int, array{popup_id: int, post_id: int, preload: bool}>
+     * @var array<int, array{popup_id: int, post_id: int}>
      */
     private array $atomic_capture_stack = [];
+
+    /**
+     * Every (post, popup) pairing a trigger on this page established.
+     *
+     * Keyed post ID → set of popup IDs, because the same post can be triggered
+     * against more than one popup on a page and the payload has to satisfy all of
+     * them: LPB.posts is one cache entry per post, shared by every popup.
+     *
+     * @var array<int, array<int, true>>
+     */
+    private array $preload_plan = [];
 
     /**
      * Registers the Elementor render hooks and the script enqueue hook.
@@ -52,6 +67,12 @@ final class FrontendManager
 
         // Fires only on pages where Elementor has output — no need to check is_admin().
         add_action('elementor/frontend/after_enqueue_scripts', [$this, 'enqueue_assets']);
+
+        // Late enough that every trigger on the page has rendered and registered its
+        // (post, popup) pairing. Still early enough to matter: the bundle defers all
+        // of its work to DOMContentLoaded, so a script printed after it in the footer
+        // is guaranteed to run first.
+        add_action('wp_footer', [$this, 'print_preload_payload'], 999);
     }
 
     /**
@@ -90,16 +111,16 @@ final class FrontendManager
             return;
         }
 
+        $post_id = (int) get_the_ID();
+
         $element->add_render_attribute('_wrapper', [
             'data-lpb-trigger'  => '1',
-            'data-lpb-post-id'  => (string) (int) get_the_ID(),
+            'data-lpb-post-id'  => (string) $post_id,
             'data-lpb-popup-id' => (string) $popup_id,
             'class'             => 'lpb-trigger',
         ]);
 
-        if (!empty($settings['lpb_preload_data']) && 'yes' === $settings['lpb_preload_data']) {
-            $element->add_render_attribute('_wrapper', 'data-lpb-preload', '1');
-        }
+        $this->record_preload($post_id, $popup_id);
     }
 
     /**
@@ -125,11 +146,14 @@ final class FrontendManager
             return;
         }
 
+        $post_id = (int) get_the_ID();
+
         $this->atomic_capture_stack[] = [
             'popup_id' => $popup_id,
-            'post_id'  => (int) get_the_ID(),
-            'preload'  => true === $element->get_atomic_setting('lpb_preload_data'),
+            'post_id'  => $post_id,
         ];
+
+        $this->record_preload($post_id, $popup_id);
 
         ob_start();
     }
@@ -169,15 +193,123 @@ final class FrontendManager
             return;
         }
 
-        $preload_attr = $data['preload'] ? ' data-lpb-preload="1"' : '';
-
         // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
         echo '<div data-lpb-trigger="1"'
             . ' data-lpb-post-id="'  . esc_attr((string) $data['post_id'])  . '"'
             . ' data-lpb-popup-id="' . esc_attr((string) $data['popup_id']) . '"'
             . ' class="lpb-trigger"'
-            . $preload_attr
             . '>' . $content . '</div>';
+    }
+
+    // ── Preload payload ───────────────────────────────────────────────────────────
+
+    /**
+     * Notes that a trigger on this page pairs a post with a popup.
+     *
+     * @return void
+     */
+    private function record_preload(int $post_id, int $popup_id): void
+    {
+        if ($post_id <= 0 || $popup_id <= 0) {
+            return;
+        }
+
+        $this->preload_plan[$post_id][$popup_id] = true;
+    }
+
+    /**
+     * Renders the complete data payload for every trigger on the page.
+     *
+     * This is what makes the preload real. The meta keys a popup binds can only be
+     * read from the popup's own DOM, and Elementor Pro keeps that DOM out of the
+     * page until the popup's first open — so the frontend could never work out what
+     * to ask for ahead of a click, and preloading returned an empty custom_meta
+     * every time. Here the keys come from the popup's saved data instead, and the
+     * values come with them, so LPB.posts is complete before any script runs and
+     * the first click needs no network at all.
+     *
+     * One entry per post, carrying the union of the keys of every popup that post
+     * triggers. Filling only ever writes bindings that exist in the popup being
+     * filled, so a payload wider than one popup needs cannot leak into it.
+     *
+     * @return void
+     */
+    public function print_preload_payload(): void
+    {
+        if (empty($this->preload_plan)) {
+            return;
+        }
+
+        $posts           = [];
+        $post_meta_keys  = [];
+        $popup_meta_keys = [];
+
+        foreach ($this->preload_plan as $post_id => $popup_ids) {
+            $keys = [];
+
+            foreach (array_keys($popup_ids) as $popup_id) {
+                $popup_keys = PopupBindingScanner::get_meta_keys($popup_id);
+
+                $popup_meta_keys[$popup_id] = $popup_keys;
+                $keys                       = array_merge($keys, $popup_keys);
+            }
+
+            $payload = PostPayload::build($post_id, $keys);
+
+            // Unpublished, password-protected or non-public: emit nothing rather
+            // than a partial entry. A cached partial would never be refetched,
+            // because the cache is only ever widened, never invalidated.
+            if ($payload instanceof \WP_Error) {
+                continue;
+            }
+
+            $posts[$post_id] = $payload;
+
+            $flags = [];
+            foreach ($payload['meta_keys_loaded'] as $key) {
+                $flags[$key] = true;
+            }
+            $post_meta_keys[$post_id] = (object) $flags;
+        }
+
+        if (empty($posts) && empty($popup_meta_keys)) {
+            return;
+        }
+
+        // Object.assign rather than assignment: the shell object is already on the
+        // page, and anything a third party put in these maps stays put.
+        wp_print_inline_script_tag(
+            sprintf(
+                'window.LoopPopupBridge = window.LoopPopupBridge || {};'
+                . 'window.LoopPopupBridge.posts = Object.assign(window.LoopPopupBridge.posts || {}, %s);'
+                . 'window.LoopPopupBridge.postMetaKeys = Object.assign(window.LoopPopupBridge.postMetaKeys || {}, %s);'
+                . 'window.LoopPopupBridge.popupMetaKeys = Object.assign(window.LoopPopupBridge.popupMetaKeys || {}, %s);',
+                self::encode_for_inline_script($posts),
+                self::encode_for_inline_script($post_meta_keys),
+                self::encode_for_inline_script($popup_meta_keys)
+            )
+        );
+    }
+
+    /**
+     * JSON-encodes a post-ID-keyed map for embedding inside a <script> element.
+     *
+     * Two details matter and neither is cosmetic:
+     *
+     *  - The top level is cast to an object so PHP emits `{"512": …}` rather than a
+     *    JSON array, and the cast is applied ONLY at the top level: array-valued
+     *    meta (an ACF repeater, a multi-select) has to stay a JS array, which is
+     *    why JSON_FORCE_OBJECT is wrong here.
+     *  - JSON_HEX_TAG escapes < and > so a post whose content contains a literal
+     *    "</script>" cannot terminate the tag it is embedded in. Slash escaping is
+     *    deliberately left on for the same reason. Both decode back to the original
+     *    characters in JS, so the payload the frontend sees is unchanged.
+     *
+     * @param array<int, mixed> $map
+     */
+    private static function encode_for_inline_script(array $map): string
+    {
+        return (string) wp_json_encode((object) $map, JSON_HEX_TAG | JSON_UNESCAPED_UNICODE);
     }
 
     /**
@@ -189,12 +321,19 @@ final class FrontendManager
      *
      * An inline script injected before the bundle initialises the global
      * window.LoopPopupBridge context object with:
-     *   activePostId  — null until a trigger is clicked
-     *   activePopupId — null until a trigger is clicked
-     *   posts         — client-side cache keyed by post ID: { [postId]: postData }
-     *   postMetaKeys  — cache index of custom meta keys already loaded per post
-     *   restUrl       — base URL of the custom REST endpoint
-     *   nonce         — wp_rest nonce for authenticated REST requests
+     *   activePostId   — null until a trigger is clicked
+     *   activePopupId  — null until a trigger is clicked
+     *   posts          — cache keyed by post ID: { [postId]: postData }
+     *   postMetaKeys   — cache index of custom meta keys already loaded per post
+     *   popupMetaKeys  — meta keys each popup binds, resolved from its saved data:
+     *                    { [popupId]: [key, …] }. This is what lets the frontend
+     *                    know what a popup needs before that popup has ever been
+     *                    opened, which is impossible to read from the DOM.
+     *   restUrl        — base URL of the custom REST endpoint
+     *   nonce          — wp_rest nonce for authenticated REST requests
+     *
+     * print_preload_payload() fills posts, postMetaKeys and popupMetaKeys in the
+     * footer; this shell only guarantees they exist.
      *
      * @return void
      */
@@ -216,7 +355,7 @@ final class FrontendManager
         wp_add_inline_script(
             'loop-popup-bridge',
             sprintf(
-                'window.LoopPopupBridge = window.LoopPopupBridge || { activePostId: null, activePopupId: null, posts: {}, postMetaKeys: {}, restUrl: %s, nonce: %s };',
+                'window.LoopPopupBridge = window.LoopPopupBridge || { activePostId: null, activePopupId: null, posts: {}, postMetaKeys: {}, popupMetaKeys: {}, restUrl: %s, nonce: %s };',
                 wp_json_encode(rest_url('loop-popup-bridge/v1/post/')),
                 wp_json_encode(wp_create_nonce('wp_rest'))
             ),

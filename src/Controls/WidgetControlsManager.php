@@ -168,20 +168,11 @@ final class WidgetControlsManager
             ]
         );
 
-        // ── Preload option ────────────────────────────────────────────────────
-        $element->add_control(
-            'lpb_preload_data',
-            [
-                'label'        => esc_html__('Preload Post Data', 'loop-popup-bridge'),
-                'type'         => Controls_Manager::SWITCHER,
-                'label_on'     => esc_html__('Yes', 'loop-popup-bridge'),
-                'label_off'    => esc_html__('No', 'loop-popup-bridge'),
-                'return_value' => 'yes',
-                'default'      => '',
-                'description'  => esc_html__("Marks the element so JavaScript pre-fetches this post's data on page load rather than waiting for the first click.", 'loop-popup-bridge'),
-                'condition'    => ['lpb_enable_trigger' => 'yes'],
-            ]
-        );
+        // There is deliberately no preload control. Post data is rendered into the
+        // page for every trigger, always — see FrontendManager::print_preload_payload().
+        // Making it optional was never a real choice: with it off the first click
+        // paid for a round-trip, and with it on the preload could not discover the
+        // popup's meta keys anyway, so it fetched an empty custom_meta either way.
 
         $element->end_controls_section();
     }
@@ -206,6 +197,11 @@ final class WidgetControlsManager
 
         $schema['lpb_enable_trigger'] = \Elementor\Modules\AtomicWidgets\PropTypes\Primitives\Boolean_Prop_Type::make();
         $schema['lpb_popup_id']       = \Elementor\Modules\AtomicWidgets\PropTypes\Primitives\String_Prop_Type::make();
+
+        // lpb_preload_data no longer has a control — preloading is unconditional —
+        // but the prop stays in the schema. Widgets saved while the switch existed
+        // still carry the value, and dropping it from the schema would make those
+        // widgets fail validation rather than simply ignoring a prop nothing reads.
         $schema['lpb_preload_data']   = \Elementor\Modules\AtomicWidgets\PropTypes\Primitives\Boolean_Prop_Type::make();
 
         return $schema;
@@ -238,9 +234,6 @@ final class WidgetControlsManager
                     ->set_label(esc_html__('Popup', 'loop-popup-bridge'))
                     ->set_options($this->get_atomic_popup_options())
                     ->set_placeholder(esc_html__('Select a popup…', 'loop-popup-bridge')),
-                \Elementor\Modules\AtomicWidgets\Controls\Types\Switch_Control::bind_to('lpb_preload_data')
-                    ->set_label(esc_html__('Preload Post Data', 'loop-popup-bridge'))
-                    ->set_description(esc_html__('Marks the element so JavaScript pre-fetches this post\'s data on page load rather than waiting for the first click.', 'loop-popup-bridge')),
             ]);
 
         return $controls;
@@ -277,7 +270,6 @@ final class WidgetControlsManager
             'body.lpb-hide-loop-popup-bridge .elementor-control-lpb_section,
              body.lpb-hide-loop-popup-bridge .elementor-control-lpb_enable_trigger,
              body.lpb-hide-loop-popup-bridge .elementor-control-lpb_popup_id,
-             body.lpb-hide-loop-popup-bridge .elementor-control-lpb_preload_data,
              body.lpb-dynamic-tags-ready:not(.lpb-popup-context) .elementor-tags-list__item[data-tag-name="lpb-clicked-post-field"],
              body.lpb-dynamic-tags-ready:not(.lpb-popup-context) .elementor-tags-list__item[data-tag-name="lpb-clicked-post-form-value"],
              body.lpb-dynamic-tags-ready.lpb-popup-context.lpb-form-widget-context .elementor-tags-list__item[data-tag-name="lpb-clicked-post-field"],

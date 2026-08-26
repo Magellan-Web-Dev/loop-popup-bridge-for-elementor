@@ -96,6 +96,55 @@
     }
 
     /**
+     * The same "unknown is not empty" rule, for base post fields.
+     *
+     * The page does not inline every base field: `content` is only rendered when a
+     * popup actually binds it, and a site can trim more through lpb_preload_fields.
+     * A field the payload never carried is unknown, so filling from it would blank a
+     * binding rather than leave it for a payload that can answer.
+     *
+     * Presence is the test, not truthiness — a post with a genuinely empty excerpt
+     * has `excerpt: ""` in the payload and must render its fallback, not refetch
+     * forever. `id` is exempt: it is always present and is not a fill target.
+     *
+     * @param  {Object|null} binding
+     * @param  {Object|null} postData
+     * @return {boolean}
+     */
+    function isUnloadedFieldBinding(binding, postData) {
+        if (!binding || !binding.fieldName || binding.fieldName === 'meta') {
+            return false;
+        }
+
+        if (!postData || binding.fieldName === 'id') {
+            return false;
+        }
+
+        return !Object.prototype.hasOwnProperty.call(postData, binding.fieldName);
+    }
+
+    /** Base fields the popup's bindings need but the cached payload does not carry. */
+    function missingFieldsForPopup(popupId, postId) {
+        var postData = LPB.posts[postId];
+        var missing  = {};
+
+        if (!postData) { return []; }
+
+        var root = getPopupContainer(popupId);
+        if (!root) { return []; }
+
+        root.querySelectorAll(bindingSelector).forEach(function (el) {
+            var binding = getBinding(el);
+
+            if (isUnloadedFieldBinding(binding, postData)) {
+                missing[binding.fieldName] = true;
+            }
+        });
+
+        return Object.keys(missing);
+    }
+
+    /**
      * Builds the REST URL, including requested meta keys and the popup to resolve.
      *
      * Passing popup_id asks the server to add whatever meta keys that popup binds,
@@ -160,9 +209,15 @@
      * @param  {number} postId
      * @param  {Array<string>} metaKeys
      * @param  {number} [popupId]  Popup whose bindings the server should resolve.
+     * @param  {boolean} [force]   Request even when the meta-key cache is satisfied.
+     *                             The base fields are the reason: the cache index
+     *                             tracks meta keys only, so a payload missing a base
+     *                             field still looks complete to it. The REST response
+     *                             always carries every base field, so one forced
+     *                             request is what fills them.
      * @return {Promise<Object|null>}
      */
-    function fetchPostData(postId, metaKeys, popupId) {
+    function fetchPostData(postId, metaKeys, popupId, force) {
         metaKeys = normalizeMetaKeys(metaKeys);
         popupId  = parseInt(popupId, 10) || 0;
 
@@ -172,13 +227,14 @@
         // the request through once and the server fills in the key list.
         var popupResolved = !popupId || !!LPB.popupMetaKeys[popupId];
 
-        if (popupResolved && hasCachedMetaKeys(postId, metaKeys)) {
+        if (!force && popupResolved && hasCachedMetaKeys(postId, metaKeys)) {
             return Promise.resolve(LPB.posts[postId]);
         }
 
         var alreadyCached = Object.keys(LPB.postMetaKeys[postId] || {});
         var keysToRequest = normalizeMetaKeys(alreadyCached.concat(metaKeys));
-        var requestKey    = postId + '|' + popupId + '|' + keysToRequest.slice().sort().join(',');
+        var requestKey    = postId + '|' + popupId + '|' + (force ? 'f|' : '')
+            + keysToRequest.slice().sort().join(',');
 
         if (inFlightRequests[requestKey]) {
             return inFlightRequests[requestKey];
@@ -336,10 +392,12 @@
             var binding = getBinding(el);
             if (!binding) { return; }
 
-            // Unknown is not empty: a meta key this payload never requested is left
-            // exactly as it is, so a narrower pass cannot blank a field a wider one
-            // already filled. See isUnloadedMetaBinding().
+            // Unknown is not empty: a meta key this payload never requested, or a
+            // base field it never carried, is left exactly as it is, so a narrower
+            // pass cannot blank a field a wider one already filled.
+            // See isUnloadedMetaBinding() / isUnloadedFieldBinding().
             if (isUnloadedMetaBinding(binding, postId)) { return; }
+            if (isUnloadedFieldBinding(binding, postData)) { return; }
 
             if (binding.target === 'url') {
                 fillUrlBinding(el, binding, postData);
@@ -1198,6 +1256,25 @@
             // dispatchSelectionEvent is idempotent per token, so when the click did
             // its job this is a no-op rather than a second event.
             dispatchSelectionEvent(postId, popupId, token, LPB.posts[postId] || postData);
+
+            // Now that the popup's own DOM is readable, check whether any of its
+            // bindings need a base field the page did not inline — `content` when the
+            // server scan did not see it bound, or anything lpb_preload_fields trimmed.
+            // One forced request brings back every base field and fills them, which is
+            // what keeps trimming a performance choice rather than a broken binding.
+            //
+            // Deliberately after the dispatch: the event carries the fields the popup
+            // asked for, and this only ever adds base fields the popup itself reads.
+            // Holding the announcement for it would reintroduce the wait that moving
+            // the event to click time removed.
+            if (missingFieldsForPopup(popupId, postId).length) {
+                return fetchPostData(postId, requiredMetaKeys(popupId), popupId, true)
+                    .then(function () {
+                        if (!isCurrentSelection(postId, popupId, token)) { return; }
+
+                        populatePopupFields(popupId, postId);
+                    });
+            }
         });
 
         return hydrationPromise;

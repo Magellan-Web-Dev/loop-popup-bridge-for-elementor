@@ -62,14 +62,14 @@ final class PopupBindingScanner
      * Per-request memo, keyed by popup ID. A page with a dozen loop items all
      * pointing at one popup resolves it once.
      *
-     * @var array<int, string[]>
+     * @var array<int, array{fields: string[], meta_keys: string[]}>
      */
     private static array $cache = [];
 
     /**
      * The decoded transient, or null before the first read this request.
      *
-     * @var array<int, array{stamp: string, keys: string[]}>|null
+     * @var array<int, array{stamp: string, bindings: array{fields: string[], meta_keys: string[]}}>|null
      */
     private static ?array $stored = null;
 
@@ -81,20 +81,35 @@ final class PopupBindingScanner
     /**
      * Returns the custom meta keys the given popup's bindings read.
      *
-     * The result is deliberately NOT intersected with the allowlist. A key that is
-     * requested but not allowlisted comes back with an empty value, and the
+     * @return string[] Sanitised, unique meta keys. Empty when $popup_id is not a popup.
+     */
+    public static function get_meta_keys(int $popup_id): array
+    {
+        return self::get_bindings($popup_id)['meta_keys'];
+    }
+
+    /**
+     * Returns everything the given popup's bindings read, in two sets:
+     *   fields    — base post fields (title, content, permalink, …)
+     *   meta_keys — custom/ACF meta keys
+     *
+     * The meta keys are deliberately NOT intersected with the allowlist. A key that
+     * is requested but not allowlisted comes back with an empty value, and the
      * frontend treats that as "resolved and empty" — which renders the binding's
      * configured fallback. Filtering it out here instead would leave the binding
      * permanently "unknown", so every popup open would refetch it and never fill.
      * PostPayload enforces the allowlist on the values, which is the gate that
      * actually matters.
      *
-     * @return string[] Sanitised, unique meta keys. Empty when $popup_id is not a popup.
+     * The fields set exists so the page can skip building `content` for the popups
+     * that never bind it — the one field expensive enough to be worth asking about.
+     *
+     * @return array{fields: string[], meta_keys: string[]}
      */
-    public static function get_meta_keys(int $popup_id): array
+    public static function get_bindings(int $popup_id): array
     {
         if ($popup_id <= 0) {
-            return [];
+            return ['fields' => [], 'meta_keys' => []];
         }
 
         if (isset(self::$cache[$popup_id])) {
@@ -104,22 +119,23 @@ final class PopupBindingScanner
         // Guards the REST popup_id parameter: without this, any post ID would be a
         // request to walk that post's Elementor data.
         if (!self::is_popup($popup_id)) {
-            return self::$cache[$popup_id] = [];
+            return self::$cache[$popup_id] = ['fields' => [], 'meta_keys' => []];
         }
 
         $stamp  = self::get_stamp($popup_id);
         $stored = self::read_store();
 
         if (isset($stored[$popup_id]) && $stored[$popup_id]['stamp'] === $stamp) {
-            return self::$cache[$popup_id] = $stored[$popup_id]['keys'];
+            return self::$cache[$popup_id] = $stored[$popup_id]['bindings'];
         }
 
         $visited = [$popup_id => true];
-        $keys    = [];
+        $found   = ['fields' => [], 'meta_keys' => []];
 
-        self::walk(self::load_elements($popup_id), $keys, $visited, 0);
+        self::walk(self::load_elements($popup_id), $found, $visited, 0);
 
-        $keys = array_values(array_unique(array_filter(array_map('sanitize_key', $keys))));
+        $keys   = self::clean($found['meta_keys']);
+        $fields = self::clean($found['fields']);
 
         /**
          * Filters the meta keys preloaded for a popup.
@@ -131,24 +147,44 @@ final class PopupBindingScanner
          * @param string[] $keys     Keys resolved from the popup's saved data.
          * @param int      $popup_id The popup being scanned.
          */
-        $keys = (array) apply_filters('lpb_popup_meta_keys', $keys, $popup_id);
-        $keys = array_values(array_unique(array_filter(array_map('sanitize_key', $keys))));
+        $keys = self::clean((array) apply_filters('lpb_popup_meta_keys', $keys, $popup_id));
 
-        self::write_store($popup_id, $stamp, $keys);
+        /**
+         * Filters the base post fields preloaded for a popup.
+         *
+         * @param string[] $fields   Base field names resolved from the popup's saved data.
+         * @param int      $popup_id The popup being scanned.
+         */
+        $fields = self::clean((array) apply_filters('lpb_popup_fields', $fields, $popup_id));
 
-        return self::$cache[$popup_id] = $keys;
+        $bindings = ['fields' => $fields, 'meta_keys' => $keys];
+
+        self::write_store($popup_id, $stamp, $bindings);
+
+        return self::$cache[$popup_id] = $bindings;
+    }
+
+    /**
+     * sanitize_key + drop empties + dedupe, reindexed.
+     *
+     * @param  array<int, mixed> $values
+     * @return string[]
+     */
+    private static function clean(array $values): array
+    {
+        return array_values(array_unique(array_filter(array_map('sanitize_key', $values))));
     }
 
     // ── Scanning ──────────────────────────────────────────────────────────────────
 
     /**
-     * Walks a list of Elementor element nodes, collecting meta keys as it goes.
+     * Walks a list of Elementor element nodes, collecting bindings as it goes.
      *
-     * @param mixed            $nodes
-     * @param string[]         $keys    Accumulator.
-     * @param array<int, true> $visited Document IDs already walked; stops template cycles.
+     * @param mixed                                          $nodes
+     * @param array{fields: string[], meta_keys: string[]}    $found   Accumulator.
+     * @param array<int, true>                               $visited Document IDs already walked; stops template cycles.
      */
-    private static function walk(mixed $nodes, array &$keys, array &$visited, int $depth): void
+    private static function walk(mixed $nodes, array &$found, array &$visited, int $depth): void
     {
         if ($depth > self::MAX_DEPTH || !is_array($nodes)) {
             return;
@@ -162,14 +198,34 @@ final class PopupBindingScanner
             $settings = isset($node['settings']) && is_array($node['settings']) ? $node['settings'] : [];
 
             if (!empty($settings)) {
-                self::collect_dynamic_tag_keys($settings, $keys);
-                self::collect_literal_marker_keys($settings, $keys, 0);
-                self::follow_nested_template($node, $settings, $keys, $visited, $depth);
+                self::collect_dynamic_tag_bindings($settings, $found);
+                self::collect_literal_marker_bindings($settings, $found, 0);
+                self::follow_nested_template($node, $settings, $found, $visited, $depth);
             }
 
             if (isset($node['elements'])) {
-                self::walk($node['elements'], $keys, $visited, $depth + 1);
+                self::walk($node['elements'], $found, $visited, $depth + 1);
             }
+        }
+    }
+
+    /**
+     * Files a resolved binding into the right set.
+     *
+     * @param array{field: string, meta_key: string}      $binding
+     * @param array{fields: string[], meta_keys: string[]} $found
+     */
+    private static function record(array $binding, array &$found): void
+    {
+        if ('meta' === $binding['field']) {
+            if ('' !== $binding['meta_key']) {
+                $found['meta_keys'][] = $binding['meta_key'];
+            }
+            return;
+        }
+
+        if ('' !== $binding['field']) {
+            $found['fields'][] = $binding['field'];
         }
     }
 
@@ -187,10 +243,10 @@ final class PopupBindingScanner
      * renders, which is what keeps the two in step (including the "custom" +
      * custom_key indirection, where the key lives in a sibling control).
      *
-     * @param array<string, mixed> $settings
-     * @param string[]             $keys     Accumulator.
+     * @param array<string, mixed>                        $settings
+     * @param array{fields: string[], meta_keys: string[]} $found Accumulator.
      */
-    private static function collect_dynamic_tag_keys(array $settings, array &$keys): void
+    private static function collect_dynamic_tag_bindings(array $settings, array &$found): void
     {
         $dynamic = $settings['__dynamic__'] ?? null;
 
@@ -226,8 +282,8 @@ final class PopupBindingScanner
                 (string) ($config['custom_key'] ?? '')
             );
 
-            if (null !== $binding && 'meta' === $binding['field'] && '' !== $binding['meta_key']) {
-                $keys[] = $binding['meta_key'];
+            if (null !== $binding) {
+                self::record($binding, $found);
             }
         }
     }
@@ -241,9 +297,9 @@ final class PopupBindingScanner
      * widget's _attributes. Unlike the dynamic-tag path these are stored verbatim,
      * so a pattern match is both sufficient and necessary.
      *
-     * @param string[] $keys Accumulator.
+     * @param array{fields: string[], meta_keys: string[]} $found Accumulator.
      */
-    private static function collect_literal_marker_keys(mixed $value, array &$keys, int $depth): void
+    private static function collect_literal_marker_bindings(mixed $value, array &$found, int $depth): void
     {
         if ($depth > self::MAX_DEPTH) {
             return;
@@ -251,7 +307,7 @@ final class PopupBindingScanner
 
         if (is_array($value)) {
             foreach ($value as $item) {
-                self::collect_literal_marker_keys($item, $keys, $depth + 1);
+                self::collect_literal_marker_bindings($item, $found, $depth + 1);
             }
             return;
         }
@@ -260,37 +316,65 @@ final class PopupBindingScanner
             return;
         }
 
+        // ── Meta keys ─────────────────────────────────────────────────────────────
+
         // data-lpb-field="meta" data-lpb-meta-key="key"
         if (preg_match_all('/data-lpb-meta-key\s*=\s*["\']?([A-Za-z0-9_\-]+)/', $value, $matches)) {
-            $keys = array_merge($keys, $matches[1]);
+            $found['meta_keys'] = array_merge($found['meta_keys'], $matches[1]);
         }
 
         // The <a href> hash marker and the <img src> query marker; values are
         // rawurlencode()d by FieldRegistry when written.
         if (preg_match_all('/[?&#]lpb-meta-key=([A-Za-z0-9_%\-]+)/', $value, $matches)) {
             foreach ($matches[1] as $encoded) {
-                $keys[] = rawurldecode($encoded);
+                $found['meta_keys'][] = rawurldecode($encoded);
             }
         }
 
         // Form markers: lpb-bind:meta:key, lpb-bind-select:meta:key, lpb-bind-radio:meta:key
         if (preg_match_all('/lpb-bind(?:-select|-radio)?:meta:([A-Za-z0-9_\-]+)/', $value, $matches)) {
-            $keys = array_merge($keys, $matches[1]);
+            $found['meta_keys'] = array_merge($found['meta_keys'], $matches[1]);
         }
+
+        // ── Base fields ───────────────────────────────────────────────────────────
+        // The same three marker shapes, in the branch where the selection is a post
+        // field rather than "meta". `meta` itself is filtered out below because it
+        // is a discriminator, not a field name — its key was collected above.
+
+        if (preg_match_all('/data-lpb-field\s*=\s*["\']?([A-Za-z0-9_\-]+)/', $value, $matches)) {
+            $found['fields'] = array_merge($found['fields'], $matches[1]);
+        }
+
+        if (preg_match_all('/[?&#]lpb-field=([A-Za-z0-9_%\-]+)/', $value, $matches)) {
+            foreach ($matches[1] as $encoded) {
+                $found['fields'][] = rawurldecode($encoded);
+            }
+        }
+
+        // Negative lookahead on "meta:" so lpb-bind:meta:key does not also register
+        // a field literally named "meta".
+        if (preg_match_all('/lpb-bind(?:-select|-radio)?:(?!meta:)([A-Za-z0-9_\-]+)/', $value, $matches)) {
+            $found['fields'] = array_merge($found['fields'], $matches[1]);
+        }
+
+        $found['fields'] = array_values(array_filter(
+            $found['fields'],
+            static fn(string $field): bool => 'meta' !== $field
+        ));
     }
 
     /**
      * Follows a Template widget into the document it embeds.
      *
-     * @param array<string, mixed> $node
-     * @param array<string, mixed> $settings
-     * @param string[]             $keys     Accumulator.
-     * @param array<int, true>     $visited  Guards against a template including itself.
+     * @param array<string, mixed>                        $node
+     * @param array<string, mixed>                        $settings
+     * @param array{fields: string[], meta_keys: string[]} $found   Accumulator.
+     * @param array<int, true>                            $visited Guards against a template including itself.
      */
     private static function follow_nested_template(
         array $node,
         array $settings,
-        array &$keys,
+        array &$found,
         array &$visited,
         int $depth
     ): void {
@@ -306,7 +390,7 @@ final class PopupBindingScanner
 
         $visited[$template_id] = true;
 
-        self::walk(self::load_elements($template_id), $keys, $visited, $depth + 1);
+        self::walk(self::load_elements($template_id), $found, $visited, $depth + 1);
     }
 
     /**
@@ -354,7 +438,7 @@ final class PopupBindingScanner
     }
 
     /**
-     * @return array<int, array{stamp: string, keys: string[]}>
+     * @return array<int, array{stamp: string, bindings: array{fields: string[], meta_keys: string[]}}>
      */
     private static function read_store(): array
     {
@@ -373,13 +457,13 @@ final class PopupBindingScanner
      * Deferring the write means a page rendering a dozen popups performs one
      * transient write instead of a dozen.
      *
-     * @param string[] $keys
+     * @param array{fields: string[], meta_keys: string[]} $bindings
      */
-    private static function write_store(int $popup_id, string $stamp, array $keys): void
+    private static function write_store(int $popup_id, string $stamp, array $bindings): void
     {
         self::read_store();
 
-        self::$stored[$popup_id] = ['stamp' => $stamp, 'keys' => $keys];
+        self::$stored[$popup_id] = ['stamp' => $stamp, 'bindings' => $bindings];
 
         if (!self::$stored_dirty) {
             self::$stored_dirty = true;

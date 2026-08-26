@@ -23,7 +23,7 @@ if (!defined('ABSPATH')) exit;
 final class PostPayload
 {
     /**
-     * Payload fields a site may trim via the lpb_preload_fields filter.
+     * Every base field the payload can carry.
      *
      * `id`, `custom_meta` and `meta_keys_loaded` are deliberately absent: they are
      * structural rather than content, and the frontend's cache bookkeeping reads
@@ -31,7 +31,7 @@ final class PostPayload
      *
      * @var string[]
      */
-    private const OPTIONAL_FIELDS = [
+    public const BASE_FIELDS = [
         'title',
         'excerpt',
         'content',
@@ -52,11 +52,16 @@ final class PostPayload
      *   3. Post is not password-protected.
      *   4. Post type is publicly accessible.
      *
-     * @param  int      $post_id             Post to describe.
-     * @param  string[] $requested_meta_keys Meta keys the caller wants, pre-allowlist.
+     * @param  int           $post_id             Post to describe.
+     * @param  string[]      $requested_meta_keys Meta keys the caller wants, pre-allowlist.
+     * @param  string[]|null $fields              Base fields to include; null means all of
+     *                                            them. REST passes null so its response is
+     *                                            always complete and can serve as the
+     *                                            frontend's fallback for anything the
+     *                                            inline payload left out.
      * @return array<string, mixed>|\WP_Error
      */
-    public static function build(int $post_id, array $requested_meta_keys): array|\WP_Error
+    public static function build(int $post_id, array $requested_meta_keys, ?array $fields = null): array|\WP_Error
     {
         $post = get_post($post_id);
 
@@ -98,18 +103,19 @@ final class PostPayload
         )));
 
         $allowed_keys = self::resolve_allowed_meta_keys($requested_meta_keys);
-        $fields       = self::resolve_fields($post->ID);
+        $fields       = self::resolve_fields($fields);
 
         $data = ['id' => $post->ID];
 
-        // Built per requested field rather than all at once: `content` runs the
-        // whole the_content filter chain, which is wasted work — and on a page
-        // preloading two dozen loop items, wasted weight — when it was trimmed.
+        // Built per requested field rather than all at once: `content` is by far the
+        // most expensive one — it runs the whole the_content filter chain, which on
+        // an Elementor post means rendering a document — so a caller that does not
+        // want it must not pay for it.
         foreach ($fields as $field) {
             $data[$field] = match ($field) {
                 'title'              => wp_kses_post(get_the_title($post)),
                 'excerpt'            => wp_kses_post(get_the_excerpt($post)),
-                'content'            => wp_kses_post((string) apply_filters('the_content', $post->post_content)),
+                'content'            => wp_kses_post(self::render_content($post)),
                 'permalink'          => esc_url((string) get_permalink($post)),
                 'featured_image'     => self::get_featured_image_url($post->ID),
                 'featured_image_alt' => self::get_featured_image_alt($post->ID),
@@ -133,18 +139,61 @@ final class PostPayload
     }
 
     /**
-     * Returns the payload fields to build, after the lpb_preload_fields filter.
+     * Normalises the requested base-field list.
      *
-     * Unknown names from the filter are dropped rather than trusted, so a typo
-     * cannot inject an unbuildable key into the payload.
+     * Null means "everything". Unknown names are dropped rather than trusted, so a
+     * typo from a caller or a filter cannot inject an unbuildable key, and the
+     * result keeps BASE_FIELDS order regardless of what order it arrived in.
      *
+     * @param  string[]|null $fields
      * @return string[]
      */
-    private static function resolve_fields(int $post_id): array
+    private static function resolve_fields(?array $fields): array
     {
-        $fields = (array) apply_filters('lpb_preload_fields', self::OPTIONAL_FIELDS, $post_id);
+        if (null === $fields) {
+            return self::BASE_FIELDS;
+        }
 
-        return array_values(array_intersect(self::OPTIONAL_FIELDS, $fields));
+        return array_values(array_intersect(self::BASE_FIELDS, $fields));
+    }
+
+    /**
+     * Renders a post's content with that post actually in context.
+     *
+     * The context is the entire point. Elementor's the_content filter
+     * (Frontend::apply_builder_in_content) resolves which document to render from
+     * `get_the_ID()` and ignores the string it was handed, so filtering one post's
+     * content while a different post is current returns *that* post's builder
+     * output. In the REST context get_the_ID() is false and the mistake is
+     * invisible; at wp_footer it is the page, and every entry in the payload came
+     * back holding a copy of the whole page — 174 KB apiece, 23 times over on the
+     * page that surfaced this.
+     *
+     * Restoring by re-running setup_postdata() on the previous post rather than
+     * just reassigning $post matters too: setup_postdata() writes a whole set of
+     * globals ($id, $authordata, $page, $pages, $multipage, $more, $numpages), and
+     * leaving those pointing at a loop item would corrupt whatever renders next.
+     */
+    private static function render_content(\WP_Post $target): string
+    {
+        global $post;
+
+        $previous = $post;
+
+        $post = $target;
+        setup_postdata($post);
+
+        $rendered = (string) apply_filters('the_content', $target->post_content);
+
+        $post = $previous;
+
+        if ($previous instanceof \WP_Post) {
+            setup_postdata($previous);
+        } else {
+            wp_reset_postdata();
+        }
+
+        return $rendered;
     }
 
     /**

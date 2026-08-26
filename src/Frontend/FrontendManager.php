@@ -245,16 +245,18 @@ final class FrontendManager
         $popup_meta_keys = [];
 
         foreach ($this->preload_plan as $post_id => $popup_ids) {
-            $keys = [];
+            $keys           = [];
+            $bound_fields   = [];
 
             foreach (array_keys($popup_ids) as $popup_id) {
-                $popup_keys = PopupBindingScanner::get_meta_keys($popup_id);
+                $bindings = PopupBindingScanner::get_bindings($popup_id);
 
-                $popup_meta_keys[$popup_id] = $popup_keys;
-                $keys                       = array_merge($keys, $popup_keys);
+                $popup_meta_keys[$popup_id] = $bindings['meta_keys'];
+                $keys                       = array_merge($keys, $bindings['meta_keys']);
+                $bound_fields               = array_merge($bound_fields, $bindings['fields']);
             }
 
-            $payload = PostPayload::build($post_id, $keys);
+            $payload = PostPayload::build($post_id, $keys, $this->resolve_preload_fields($post_id, $bound_fields));
 
             // Unpublished, password-protected or non-public: emit nothing rather
             // than a partial entry. A cached partial would never be refetched,
@@ -289,6 +291,48 @@ final class FrontendManager
                 self::encode_for_inline_script($popup_meta_keys)
             )
         );
+    }
+
+    /**
+     * Decides which base fields to inline for one post.
+     *
+     * Everything cheap is always included. Only `content` is gated, because only
+     * `content` is expensive: it runs the whole the_content filter chain, and on an
+     * Elementor-built post that means rendering a document — around 20 ms and 174 KB
+     * apiece. Every other base field together comes to roughly 950 bytes per entry,
+     * so gating them would save nothing worth the risk.
+     *
+     * And the risk is real: the fill functions read fields they were not bound to.
+     * fillImageBinding() and fillPermalinkField() both fall back to postData.title
+     * for alt text and link text, so dropping `title` because no binding names it
+     * would quietly break image alt text on popups that never mention the title.
+     *
+     * @param  string[] $bound_fields Base fields the page's popups actually bind.
+     * @return string[]
+     */
+    private function resolve_preload_fields(int $post_id, array $bound_fields): array
+    {
+        $fields = array_values(array_diff(PostPayload::BASE_FIELDS, ['content']));
+
+        if (in_array('content', $bound_fields, true)) {
+            $fields[] = 'content';
+        }
+
+        /**
+         * Filters the base fields rendered into the page for a post.
+         *
+         * The escape hatch for sites whose loop posts are themselves built with
+         * Elementor, where even a correctly scoped `content` is heavy. A field
+         * dropped here is not lost: the frontend treats a field missing from the
+         * payload as unknown and fetches it from the REST endpoint when a binding
+         * needs it.
+         *
+         * @param string[] $fields  Base field names to inline.
+         * @param int      $post_id The post being rendered.
+         */
+        $fields = (array) apply_filters('lpb_preload_fields', $fields, $post_id);
+
+        return array_values(array_intersect(PostPayload::BASE_FIELDS, $fields));
     }
 
     /**

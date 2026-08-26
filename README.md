@@ -90,13 +90,18 @@ add_filter('lpb_popup_meta_keys', function (array $keys, int $popup_id): array {
 }, 10, 2);
 ```
 
-**Page weight.** The payload is in the HTML now, and `content` is by far the largest field. Trim what your popups do not bind:
+**Page weight.** The payload is in the HTML, so its size is the page's size. `content` dominates it — it runs the whole `the_content` filter chain, which on an Elementor-built post means rendering a document, and it is the only field big enough to matter. Every other base field together comes to roughly 950 bytes per entry.
+
+So `content` is inlined **only when a popup actually binds the Content field**, determined by the same scan that resolves the meta keys. A popup that never uses it costs nothing. Where the loop posts are themselves built with Elementor, even a correctly scoped `content` is heavy (~20 ms and ~174 KB each) — trim it:
 
 ```php
-add_filter('lpb_preload_fields', fn(array $fields): array => array_diff($fields, ['content']));
+add_filter('lpb_preload_fields', fn(array $fields, int $post_id): array
+    => array_diff($fields, ['content']), 10, 2);
 ```
 
-Only trim a field no binding reads. A complete client-side cache is never refetched, so a field removed here is a field the popup cannot fill. `id`, `custom_meta` and `meta_keys_loaded` are structural and cannot be trimmed.
+Trimming is safe. A field missing from the payload is treated as *unknown* rather than empty, so the binding is left alone and the frontend fetches the field from the REST endpoint when a popup that needs it opens — the same "unknown is not empty" rule that governs meta keys. The cost of trimming is one request on first open, not a broken binding. `id`, `custom_meta` and `meta_keys_loaded` are structural and are always present.
+
+`lpb_popup_fields` is the matching hook on the other side: it adjusts which base fields a *popup* is considered to bind, for bindings the scan cannot see.
 
 **Full-page caches** now serve the preloaded data along with the page, so it goes stale like any other cached markup. Purging on post save — which most caching plugins do by default — covers the normal case.
 

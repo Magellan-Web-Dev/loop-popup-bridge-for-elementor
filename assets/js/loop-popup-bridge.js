@@ -841,6 +841,36 @@
     }
 
     /**
+     * Restores the plain `&` separators inside a marker.
+     *
+     * Elementor's Atomic Image template escapes the resolved src twice: esc_url()
+     * turns `&` into `&#038;`, then Twig's html autoescaping escapes that entity's
+     * own `&` into `&amp;`. What reaches getAttribute('src') is therefore
+     *
+     *   ?lpb-field=meta&#038;lpb-meta-key=event_image
+     *
+     * where the legacy Image widget yields a plain `&`. The patterns below anchor
+     * each key on [?&#], so without this every segment after the first is invisible
+     * and an atomic image binding resolves with no meta key — which reads as
+     * "loaded and empty" and leaves the placeholder on screen.
+     *
+     * Only the separator is normalised, and only for reading. The element's own
+     * src/href is never rewritten from here.
+     */
+    function decodeMarkerSeparators(value) {
+        var previous;
+        var passes = 0;
+
+        do {
+            previous = value;
+            value    = value.replace(/&(?:amp|#0*38|#[xX]0*26);/g, '&');
+            passes  += 1;
+        } while (value !== previous && passes < 3);
+
+        return value;
+    }
+
+    /**
      * Parses markers like #lpb-field=meta&lpb-meta-key=event_date.
      *
      * `lpb-value-type` is optional and only present when PHP positively
@@ -848,7 +878,7 @@
      * markers rendered before that existed simply resolve to an empty type.
      */
     function parseBindingMarker(value) {
-        value = String(value || '');
+        value = decodeMarkerSeparators(String(value || ''));
 
         if (value.indexOf('lpb-field=') === -1) {
             return null;

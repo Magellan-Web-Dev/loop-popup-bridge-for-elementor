@@ -3,7 +3,7 @@
 Click any widget inside an Elementor Loop Grid item to open a shared Elementor Pro popup that is automatically populated with data from the post that was clicked.
 
 - **Requires:** WordPress 6.0+, PHP 8.1+, Elementor, Elementor Pro
-- **Tested with:** Elementor 4.0.1, Elementor Pro 4.0.1
+- **Tested with:** Elementor 4.2.3, Elementor Pro 4.2.3
 
 ---
 
@@ -283,6 +283,38 @@ Elementor's newer atomic widgets (widget types prefixed with `e-`, such as `e-im
 - **Editor:** LPB controls are injected into atomic widgets via the `elementor/atomic-widgets/controls` filter. Props are registered in the widget schema via `elementor/atomic-widgets/props-schema` so settings are preserved when saved.
 - **Frontend:** Because atomic widgets render via Twig templates (no `<div _wrapper>`), the plugin uses PHP output buffering to wrap the rendered output in a `<div data-lpb-trigger="1" …>`. The JavaScript click handler finds this wrapper with `closest()` regardless of which inner element was clicked.
 
+### Dynamic tags in atomic widgets
+
+Legacy widgets store a dynamic tag as a shortcode-like string under `settings.__dynamic__`. Atomic widgets store it as a typed prop value that *replaces* the prop it is bound to, at whatever depth that prop lives. An Atomic Image bound to **Clicked Post Image** saves as:
+
+```json
+{
+  "settings": {
+    "image": {
+      "$$type": "image",
+      "value": {
+        "src": {
+          "$$type": "dynamic",
+          "value": {
+            "name": "lpb-clicked-post-image",
+            "group": "loop-popup-bridge",
+            "settings": { "field": { "$$type": "string", "value": "meta:event_image" } }
+          }
+        },
+        "size": { "$$type": "string", "value": "full" }
+      }
+    }
+  }
+}
+```
+
+`PopupBindingScanner` reads both shapes. The atomic walk matches on the shape of the node — `$$type: "dynamic"` naming one of the plugin's own tags — rather than on a fixed path, so a tag bound to any prop of any atomic widget is discovered, and both shapes resolve through the same `FieldRegistry::resolve_selection()` the tag itself calls at render time.
+
+Two consequences of Elementor's atomic pipeline the plugin has to accommodate:
+
+- **The fallback image arrives under a different key.** Elementor resolves a dynamic tag's `MEDIA` control through `Image_Prop_Type` before the tag is constructed, so the tag receives `src`, not `url`. Elementor also merges the control's default over every media value, so `url` is always present and always holds the placeholder — which is why `src` is read first. Legacy media values carry no `src` key and are unaffected.
+- **The rendered `src` is escaped twice.** `atomic-image.html.twig` pipes the URL through `e('full_url')` (`esc_url`, which turns `&` into `&#038;`) and Twig's HTML autoescaping then escapes that entity's own `&`. The browser hands `getAttribute('src')` back as `?lpb-field=meta&#038;lpb-meta-key=…`, so the frontend normalises entity-encoded `&` separators before reading a marker. The legacy Image widget, and `href` markers in both architectures, are unaffected.
+
 ---
 
 ## Updates
@@ -294,6 +326,13 @@ The Plugins screen also adds a **Check for updates** row action. That action is 
 ---
 
 ## Changelog
+
+### 1.7.2
+- Fixed **Clicked Post Image** not populating in an Atomic Image. Elementor's atomic image template escapes the rendered `src` twice, so the binding marker reached the browser as `?lpb-field=meta&#038;lpb-meta-key=…` and everything after the first separator was invisible to the marker parser — the image resolved with no meta key and kept its placeholder. The frontend now normalises entity-encoded `&` separators when reading a marker.
+- `PopupBindingScanner` now discovers dynamic tags saved as atomic typed prop values (`$$type: "dynamic"`), at any depth in a widget's settings, so atomic bindings are preloaded rather than fetched on the popup's first open. Legacy `__dynamic__` scanning is unchanged.
+- The scanner's cache stamp carries a scan-schema salt, so results cached before this release are re-scanned without clearing unrelated transients.
+- **Clicked Post Image** now honours a fallback image chosen on an atomic image, which previously fell through to Elementor's placeholder.
+- Updated Elementor compatibility metadata through Elementor 4.2.3 and Elementor Pro 4.2.3.
 
 ### 1.0.4
 - Added GitHub release update checks and a manual "Check for updates" plugin row action.

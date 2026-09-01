@@ -93,7 +93,7 @@ final class ClickedPostImageTag extends Data_Tag
         );
 
         $fallback = (array) $this->get_settings('fallback_image');
-        $url      = esc_url_raw((string) ($fallback['url'] ?? Utils::get_placeholder_image_src()));
+        $url      = esc_url_raw(self::extract_fallback_url($fallback));
 
         if ('' === $url) {
             $url = Utils::get_placeholder_image_src();
@@ -107,5 +107,48 @@ final class ClickedPostImageTag extends Data_Tag
             'id'  => 0,
             'url' => $url,
         ];
+    }
+
+    /**
+     * Reads the fallback image URL out of whichever media shape Elementor supplied.
+     *
+     * Legacy hands the MEDIA control value through untouched, so the URL sits in
+     * `url`. Atomic resolves the same control through Image_Prop_Type before the tag
+     * is ever created, and the render-time array that produces is keyed `src`
+     * (Image_Transformer), with no `url` of its own.
+     *
+     * `src` is read first, not second, because Control_Base_Multiple::get_value()
+     * merges the control's default over every media value — so on the atomic path
+     * `url` is always present and always holds the placeholder default, which would
+     * mask the author's actual fallback. Legacy media values never carry a `src`
+     * key, so they still resolve through `url` exactly as before.
+     *
+     * @param array<string, mixed> $fallback
+     */
+    private static function extract_fallback_url(array $fallback): string
+    {
+        foreach (['src', 'url'] as $key) {
+            $url = self::normalize_url_value($fallback[$key] ?? null);
+
+            if ('' !== $url) {
+                return $url;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Accepts a scalar URL, or one wrapped a single level deep in case Elementor
+     * hands over a typed value. Anything else — a size map, an object, null — has no
+     * URL to offer, and the caller falls back to the placeholder.
+     */
+    private static function normalize_url_value(mixed $value): string
+    {
+        if (is_array($value)) {
+            $value = $value['value'] ?? $value['url'] ?? $value['src'] ?? null;
+        }
+
+        return is_scalar($value) ? trim((string) $value) : '';
     }
 }

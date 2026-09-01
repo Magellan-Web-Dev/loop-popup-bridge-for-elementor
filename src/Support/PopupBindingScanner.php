@@ -42,6 +42,18 @@ final class PopupBindingScanner
     private const MAX_DEPTH = 32;
 
     /**
+     * Scanner cache schema. Bumped whenever the scan learns to see something it
+     * previously missed, so entries cached by an older scanner are not trusted for
+     * a popup that has not been re-saved since.
+     *
+     * Separate from LPB_VERSION on purpose: that changes on every release, this
+     * changes only when a cached answer could now be wrong.
+     *
+     * @var int
+     */
+    private const SCAN_SCHEMA = 2;
+
+    /**
      * The dynamic tags whose saved settings carry an LPB binding.
      *
      * Gating on these names keeps the scan from decoding — and mis-resolving —
@@ -199,6 +211,7 @@ final class PopupBindingScanner
 
             if (!empty($settings)) {
                 self::collect_dynamic_tag_bindings($settings, $found);
+                self::collect_atomic_dynamic_bindings($settings, $found, 0);
                 self::collect_literal_marker_bindings($settings, $found, 0);
                 self::follow_nested_template($node, $settings, $found, $visited, $depth);
             }
@@ -286,6 +299,116 @@ final class PopupBindingScanner
                 self::record($binding, $found);
             }
         }
+    }
+
+    /**
+     * Collects keys from Atomic dynamic tags, which never appear under __dynamic__.
+     *
+     * An atomic widget stores a dynamic tag as a typed PropValue that *replaces*
+     * whichever prop it is bound to, wherever in the prop tree that prop happens to
+     * live. For an Atomic Image the tag replaces the nested src of the image prop —
+     * settings.image.value.src — and is shaped like:
+     *
+     *   [
+     *     '$$type' => 'dynamic',
+     *     'value'  => [
+     *       'name'     => 'lpb-clicked-post-image',
+     *       'group'    => 'loop-popup-bridge',
+     *       'settings' => ['field' => ['$$type' => 'string', 'value' => 'meta:event_image']],
+     *     ],
+     *   ]
+     *
+     * Every widget nests its props differently, so the walk matches on the shape
+     * rather than on a path: any node in the settings tree that looks like a dynamic
+     * PropValue naming an LPB tag is a binding. From there it is the same
+     * resolve_selection() the tag itself calls when it renders, so the "custom" +
+     * custom_key indirection resolves identically to the legacy path.
+     *
+     * A tag setting is itself a typed wrapper, but Elementor's own
+     * Manager::normalize_settings() accepts a plain scalar in the same slot, so
+     * unwrap_prop_value() reads either.
+     *
+     * @param array{fields: string[], meta_keys: string[]} $found Accumulator.
+     */
+    private static function collect_atomic_dynamic_bindings(mixed $value, array &$found, int $depth): void
+    {
+        if ($depth > self::MAX_DEPTH || !is_array($value)) {
+            return;
+        }
+
+        if (self::is_lpb_dynamic_prop_value($value)) {
+            /** @var array<string, mixed> $config */
+            $config = $value['value']['settings'];
+
+            $binding = FieldRegistry::resolve_selection(
+                self::unwrap_prop_value($config['field'] ?? null),
+                self::unwrap_prop_value($config['custom_key'] ?? null)
+            );
+
+            if (null !== $binding) {
+                self::record($binding, $found);
+            }
+
+            // The tag's own settings cannot hold another tag, so there is nothing
+            // below this node worth walking.
+            return;
+        }
+
+        foreach ($value as $item) {
+            self::collect_atomic_dynamic_bindings($item, $found, $depth + 1);
+        }
+    }
+
+    /**
+     * True when a settings node is an Atomic dynamic PropValue for an LPB tag.
+     *
+     * Gating on TAG_NAMES is what keeps the walk from resolving every unrelated
+     * dynamic tag in the popup, exactly as the legacy scanner does. Anything
+     * malformed — a missing name, settings that are not an array — simply is not a
+     * binding, and the caller keeps walking.
+     *
+     * @param array<mixed> $value
+     */
+    private static function is_lpb_dynamic_prop_value(array $value): bool
+    {
+        if ('dynamic' !== ($value['$$type'] ?? null)) {
+            return false;
+        }
+
+        $dynamic = $value['value'] ?? null;
+
+        if (!is_array($dynamic)) {
+            return false;
+        }
+
+        $name = $dynamic['name'] ?? null;
+
+        return is_string($name)
+            && in_array($name, self::TAG_NAMES, true)
+            && is_array($dynamic['settings'] ?? null);
+    }
+
+    /**
+     * Reads an Atomic tag setting, which is either a typed PropValue wrapper such as
+     * ['$$type' => 'string', 'value' => 'meta:event_image'] or an already-plain
+     * scalar. Mirrors Elementor's Manager::normalize_settings(), which unwraps the
+     * same pairs before handing settings to the tag.
+     *
+     * Anything that is neither — a nested object, a list, null — carries no field
+     * selection, so it resolves to '' and resolve_selection() discards it.
+     */
+    private static function unwrap_prop_value(mixed $value, int $depth = 0): string
+    {
+        if (
+            $depth < 4
+            && is_array($value)
+            && isset($value['$$type'])
+            && array_key_exists('value', $value)
+        ) {
+            return self::unwrap_prop_value($value['value'], $depth + 1);
+        }
+
+        return is_scalar($value) ? (string) $value : '';
     }
 
     /**
@@ -429,12 +552,15 @@ final class PopupBindingScanner
     }
 
     /**
-     * Cache stamp for a popup: changes whenever the popup is re-saved, and whenever
-     * the plugin is updated (so a smarter scanner invalidates last version's answers).
+     * Cache stamp for a popup: changes whenever the popup is re-saved, whenever the
+     * plugin is updated, and whenever SCAN_SCHEMA is bumped (so a smarter scanner
+     * invalidates last version's answers without touching any other transient).
      */
     private static function get_stamp(int $popup_id): string
     {
-        return (string) get_post_field('post_modified_gmt', $popup_id) . '|' . LPB_VERSION;
+        return (string) get_post_field('post_modified_gmt', $popup_id)
+            . '|' . LPB_VERSION
+            . '|s' . self::SCAN_SCHEMA;
     }
 
     /**

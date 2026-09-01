@@ -2,15 +2,15 @@
 /**
  * Plugin Name:       Loop Popup Bridge for Elementor
  * Description:       Click any widget inside an Elementor Loop Grid item to open a shared Elementor Pro popup dynamically populated from that post.
- * Version:           1.7.1
+ * Version:           1.7.2
  * Author:            Chris Paschall
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       loop-popup-bridge
  * Requires at least: 6.0
  * Requires PHP:      8.1
- * Elementor tested up to: 4.0.1
- * Elementor Pro tested up to: 4.0.1
+ * Elementor tested up to: 4.2.3
+ * Elementor Pro tested up to: 4.2.3
  *
  * Flow overview:
  *  1. WidgetControlsManager injects "Loop Popup Bridge" controls into every widget's Advanced tab.
@@ -51,7 +51,7 @@ if (version_compare(PHP_VERSION, '8.1', '<')) {
 } else {
 
     /** @var string Plugin version. */
-    define('LPB_VERSION', '1.7.1');
+    define('LPB_VERSION', '1.7.2');
 
     /** @var string Absolute path to the main plugin file. */
     define('LPB_FILE', __FILE__);

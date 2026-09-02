@@ -12,12 +12,23 @@ use Elementor\Modules\DynamicTags\Module as TagsModule;
 use LoopPopupBridge\Support\FieldRegistry;
 
 /**
- * Text dynamic tag for use in Elementor Pro form hidden fields.
+ * Text dynamic tag for use in Elementor form fields.
  *
  * Outputs a plain-text marker (e.g. "lpb-bind:title") that JavaScript recognises
- * in hidden <input> values and replaces with the clicked post's actual field data
- * when the popup opens. The marker survives as the HTML value attribute so JS can
- * re-apply it on every popup open without losing the binding template.
+ * on a form field and replaces with the clicked post's actual field data when the
+ * popup opens.
+ *
+ * The marker is written once and read from wherever the host widget puts it; the
+ * frontend's readFormValueMarker() owns that decision, so nothing here changes
+ * per widget architecture:
+ *
+ *  - Elementor v3 form fields render it into the HTML value attribute (a
+ *    textarea's default content), which hydration never overwrites.
+ *  - An Atomic Input or Textarea has no value prop at all, so it renders into the
+ *    placeholder; the frontend copies the marker to a data attribute and clears
+ *    the placeholder before a visitor could read it.
+ *  - An Atomic Checkbox or Radio renders it into its real "Choice value"
+ *    attribute, which the frontend likewise preserves before filling.
  */
 final class ClickedPostFormValueTag extends Tag
 {

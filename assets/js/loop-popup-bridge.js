@@ -141,6 +141,18 @@
             }
         });
 
+        // Scalar form bindings answer to the same guard (see fillFormBindings), so
+        // they have to be able to ask for the refetch that lifts it — otherwise a
+        // field bound to a base field the page did not inline would stay unfilled
+        // rather than merely arriving a moment late.
+        root.querySelectorAll(formValueSelector).forEach(function (el) {
+            var marker = parseFormValueMarker(readFormValueMarker(el));
+
+            if (isUnloadedFieldBinding(marker, postData)) {
+                missing[marker.fieldName] = true;
+            }
+        });
+
         return Object.keys(missing);
     }
 
@@ -440,26 +452,39 @@
     }
 
     /**
-     * Fills scalar form fields (hidden, text, email, textarea, etc.) whose value
-     * attribute / defaultValue holds an lpb-bind: marker written by
-     * ClickedPostFormValueTag. Reads from the HTML attribute so the marker
-     * survives repeated popup opens.
+     * Fills scalar form fields whose lpb-bind: marker readFormValueMarker() can
+     * find — a legacy hidden/text/email input or textarea, an Atomic Input or
+     * Textarea, or an Atomic Checkbox/Radio choice value.
+     *
+     * Legacy Elementor v3 fields still read the marker straight off the HTML value
+     * attribute / defaultValue, neither of which hydration overwrites for them.
      *
      * @param {Element} container  The popup DOM node.
      * @param {Object}  postData   Payload from the REST endpoint.
      * @param {number}  postId     Post the payload belongs to.
      */
     function fillFormBindings(container, postData, postId) {
-        container.querySelectorAll('input:not([type="radio"]):not([type="checkbox"]), textarea').forEach(function (el) {
-            var attrValue = el.tagName === 'TEXTAREA' ? el.defaultValue : el.getAttribute('value');
-            var marker = parseFormValueMarker(attrValue);
+        container.querySelectorAll(formValueSelector).forEach(function (el) {
+            var marker = parseFormValueMarker(readFormValueMarker(el));
             if (!marker) { return; }
+
+            // Unknown is not empty, the same rule fillFields() applies: a meta key
+            // this payload never requested, or a base field it never carried, must
+            // not be written at all, or a narrower pass would erase what a complete
+            // one already put in the field.
             if (isUnloadedMetaBinding(marker, postId)) { return; }
+            if (isUnloadedFieldBinding(marker, postData)) { return; }
 
             var resolved = normalizeResolvedValue(
                 resolveBindingValue(marker, postData, 'text'),
                 'text'
             );
+
+            // Only the submitted value. A checkbox or radio keeps whatever checked
+            // state the visitor or the widget gave it, and no synthetic input/change
+            // event is fired: Elementor's atomic handler reads .value off the live
+            // DOM when the form is sent (getAtomicFormFieldValue() in
+            // atomic-widgets-form-handler.js), so the write alone is enough.
             el.value = resolved !== '' ? resolved : marker.fallback;
         });
     }
@@ -784,10 +809,195 @@
         };
     }
 
+    // ── Scalar form marker transport ──────────────────────────────────────────────
+
     /**
-     * Parses the plain-text sentinel written by ClickedPostFormValueTag into the
-     * value attribute of a hidden input (e.g. "lpb-bind:title" or
-     * "lpb-bind:meta:event_date|fallback=TBD"). Returns null when the value is not an LPB marker.
+     * The exact prefix ClickedPostFormValueTag writes.
+     *
+     * The trailing colon is what keeps the choice-generation markers out:
+     * "lpb-bind-select:" and "lpb-bind-radio:" — owned by
+     * fillChoiceFieldsByMarkers() — can never match it.
+     */
+    var FORM_VALUE_PREFIX = 'lpb-bind:';
+
+    /**
+     * Where a captured scalar marker is kept.
+     *
+     * Deliberately not data-lpb-marker: that attribute already carries the
+     * select/radio choice marker, and one element must be able to hold either
+     * without shadowing the other.
+     */
+    var FORM_VALUE_MARKER_ATTR = 'data-lpb-form-value-marker';
+
+    /**
+     * An Elementor Atomic Form, in the two shapes atomic-form.html.twig prints on
+     * every render. Matching either keeps the check working if one is retired.
+     */
+    var ATOMIC_FORM_SELECTOR = 'form[data-element_type="e-form"], form[data-e-type="e-form"]';
+
+    /**
+     * The fields whose own attributes can carry a scalar marker.
+     *
+     * The first two entries are the legacy selector, unchanged: radio and checkbox
+     * stay out of it because their value attribute is where the legacy
+     * lpb-bind-radio: choice marker lives. They are re-admitted only as atomic
+     * fields, identified by the data-interaction-id that only an atomic widget
+     * renders — so a legacy radio group is never even visited.
+     */
+    var formValueSelector = [
+        'input:not([type="radio"]):not([type="checkbox"])',
+        'textarea',
+        'input[type="radio"][data-interaction-id]',
+        'input[type="checkbox"][data-interaction-id]',
+    ].join(',');
+
+    /** True when a string is a scalar form marker rather than ordinary field text. */
+    function isFormValueMarker(value) {
+        return String(value || '').indexOf(FORM_VALUE_PREFIX) === 0;
+    }
+
+    /**
+     * True for a field belonging to an Elementor Atomic Form.
+     *
+     * Both halves matter. data-interaction-id is how Elementor's own submit handler
+     * recognises an atomic field (ATOMIC_FORM_FIELD_SELECTOR in
+     * atomic-widgets-form-handler.js), and the form ancestor is what keeps an
+     * ordinary input that happens to sit in some unrelated form out of the atomic
+     * path entirely.
+     */
+    function isAtomicFormField(el) {
+        return !!el.getAttribute('data-interaction-id') && !!el.closest(ATOMIC_FORM_SELECTOR);
+    }
+
+    /** The two field types whose .value writes through to the value attribute. */
+    function isChoiceInput(el) {
+        return el.tagName === 'INPUT' && (el.type === 'radio' || el.type === 'checkbox');
+    }
+
+    /** The named entities Twig's html_attr escaper can emit. */
+    var MARKER_ENTITIES = { amp: '&', quot: '"', lt: '<', gt: '>', apos: '\'' };
+
+    /**
+     * Decodes the one entity layer an atomic attribute can arrive with.
+     *
+     * Elementor's atomic Checkbox and Radio templates build the attribute as
+     * `'value=' ~ settings.value | e('html_attr')` and then print it *without*
+     * `| raw`, so Twig's html autoescaping escapes the escaper's own output and the
+     * attribute reaches the page double-encoded. What getAttribute('value') hands
+     * back is therefore still one layer deep:
+     *
+     *   lpb-bind&#x3A;meta&#x3A;event_date&#x7C;fallback&#x3D;TBD
+     *
+     * html_attr encodes everything outside [A-Za-z0-9,._-], so a marker's own
+     * colons and pipes are always affected and the prefix test cannot match without
+     * this. Atomic Input and Textarea print their placeholder *with* `| raw`, so it
+     * arrives one layer shallower and the browser has already decoded it — running
+     * one through here is a no-op, and stays one however Elementor escapes it next,
+     * because a marker can hold no entity of its own (FieldRegistry rawurlencode()s
+     * the fallback, so neither `&` nor `#` survives as a literal).
+     */
+    function decodeMarkerEntities(value) {
+        return String(value || '').replace(
+            /&(?:#(\d{1,7})|#[xX]([0-9a-fA-F]{1,6})|([A-Za-z]{2,5}));/g,
+            function (match, dec, hex, name) {
+                if (name) {
+                    var named = MARKER_ENTITIES[name.toLowerCase()];
+
+                    return typeof named === 'string' ? named : match;
+                }
+
+                var code = dec ? parseInt(dec, 10) : parseInt(hex, 16);
+
+                // A marker only ever encodes ASCII, so anything else is not one and
+                // is left exactly as it was found.
+                return code > 0 && code <= 0xFFFF ? String.fromCharCode(code) : match;
+            }
+        );
+    }
+
+    /**
+     * Reads a marker off an Atomic Form field's own transport and preserves it.
+     *
+     * Two transports, because the atomic widgets have no single value prop:
+     *
+     *  - Atomic Input and Textarea have no value or default-value prop at all
+     *    (see input.php / textarea.php in elementor-pro/modules/atomic-form). Their
+     *    only dynamic-tag-capable text setting is `placeholder`, so a Form Text tag
+     *    renders as placeholder="lpb-bind:…" and the textarea body stays empty.
+     *  - Atomic Checkbox and Radio take the tag on their "Choice value" prop, which
+     *    does render a real value attribute.
+     *
+     * Both have to be copied onto an attribute of their own, for opposite reasons.
+     * A placeholder is what the visitor would otherwise read as help text — and
+     * what Elementor's submit handler falls back to for the field's label — so it
+     * is cleared the moment it has been captured. A choice input's value attribute
+     * is destroyed by the first fill instead: setting .value on a radio or checkbox
+     * writes through to the content attribute, so without the copy the binding
+     * would be gone before the second fill of the same open.
+     *
+     * Returns '' for anything that is not an atomic form field, so an ordinary
+     * placeholder is never read as a binding.
+     */
+    function captureAtomicFormMarker(el) {
+        if (!isAtomicFormField(el)) { return ''; }
+
+        var choice = isChoiceInput(el);
+        var raw    = decodeMarkerEntities(el.getAttribute(choice ? 'value' : 'placeholder'));
+
+        if (!isFormValueMarker(raw)) { return ''; }
+
+        el.setAttribute(FORM_VALUE_MARKER_ATTR, raw);
+
+        if (!choice) {
+            el.removeAttribute('placeholder');
+        }
+
+        return raw;
+    }
+
+    /**
+     * The one reader for scalar form markers, in a fixed order of precedence:
+     *
+     *   1. The preserved attribute — the only source that survives a fill, so it is
+     *      what every pass after the first reads.
+     *   2. The legacy transport: an input's HTML value attribute, a textarea's
+     *      defaultValue. Exactly what has always been read, and read ahead of the
+     *      atomic transport so an Elementor v3 field keeps its behaviour whatever
+     *      else happens to be on the element.
+     *   3. The atomic transport, which also preserves whatever it finds.
+     *
+     * A radio or checkbox skips step 2. One only reaches here as an atomic field,
+     * and its .value writes through to the value attribute, so its marker has to be
+     * preserved rather than read live however it arrived.
+     *
+     * Both fillFormBindings() and collectRequiredMetaKeys() go through here. That
+     * is what lets a popup request the custom meta of a binding the server-side
+     * scan could not see, and it is also what captures an atomic marker before the
+     * popup paints: collectRequiredMetaKeys() runs from the popup-show handler,
+     * ahead of both the fetch and the fill.
+     */
+    function readFormValueMarker(el) {
+        var preserved = el.getAttribute(FORM_VALUE_MARKER_ATTR);
+
+        if (isFormValueMarker(preserved)) { return preserved; }
+
+        if (!isChoiceInput(el)) {
+            var legacy = el.tagName === 'TEXTAREA' ? el.defaultValue : el.getAttribute('value');
+
+            if (isFormValueMarker(legacy)) { return legacy; }
+        }
+
+        return captureAtomicFormMarker(el);
+    }
+
+    /**
+     * Parses the plain-text sentinel written by ClickedPostFormValueTag, e.g.
+     * "lpb-bind:title" or "lpb-bind:meta:event_date|fallback=TBD". Returns null
+     * when the value is not an LPB marker — including when it is one of the
+     * choice-generation markers, which carry a longer prefix.
+     *
+     * Fed by readFormValueMarker(), which knows where a marker can be found;
+     * the format itself is the same one every version has written.
      */
     function parseFormValueMarker(value) {
         value = String(value || '');
@@ -920,10 +1130,11 @@
             }
         });
 
-        // Text markers on scalar inputs / textareas.
-        root.querySelectorAll('input:not([type="radio"]):not([type="checkbox"]), textarea').forEach(function (el) {
-            var attrValue = el.tagName === 'TEXTAREA' ? el.defaultValue : el.getAttribute('value');
-            var marker = parseFormValueMarker(attrValue);
+        // Text markers on scalar inputs / textareas, legacy and atomic alike.
+        // Reading them here is also what lifts an atomic marker off its placeholder
+        // before the popup paints — see readFormValueMarker().
+        root.querySelectorAll(formValueSelector).forEach(function (el) {
+            var marker = parseFormValueMarker(readFormValueMarker(el));
             if (marker && marker.fieldName === 'meta' && marker.metaKey) {
                 keys.push(marker.metaKey);
             }

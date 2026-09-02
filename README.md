@@ -41,7 +41,7 @@ Inside your popup, use the included dynamic tags to bind elements to the clicked
 | **Clicked Post Field** | Text / HTML widgets | Renders an inline `<span>` that JS replaces with the field value |
 | **Clicked Post URL** | Link URL fields | Inserts a hash marker that JS replaces with the post permalink or custom URL |
 | **Clicked Post Image** | Image source fields | Inserts a query-arg marker that JS replaces with the image URL |
-| **Clicked Post Form Value** | Elementor Form hidden inputs | Writes an `lpb-bind:` marker that JS replaces with the field value before submit |
+| **Clicked Post Form Value** | Elementor Form hidden inputs; Atomic Form Input / Text area / Checkbox / Radio | Writes an `lpb-bind:` marker that JS replaces with the field value before submit |
 
 **Available built-in fields:**
 
@@ -315,6 +315,30 @@ Two consequences of Elementor's atomic pipeline the plugin has to accommodate:
 - **The fallback image arrives under a different key.** Elementor resolves a dynamic tag's `MEDIA` control through `Image_Prop_Type` before the tag is constructed, so the tag receives `src`, not `url`. Elementor also merges the control's default over every media value, so `url` is always present and always holds the placeholder — which is why `src` is read first. Legacy media values carry no `src` key and are unaffected.
 - **The rendered `src` is escaped twice.** `atomic-image.html.twig` pipes the URL through `e('full_url')` (`esc_url`, which turns `&` into `&#038;`) and Twig's HTML autoescaping then escapes that entity's own `&`. The browser hands `getAttribute('src')` back as `?lpb-field=meta&#038;lpb-meta-key=…`, so the frontend normalises entity-encoded `&` separators before reading a marker. The legacy Image widget, and `href` markers in both architectures, are unaffected.
 
+### Atomic Form fields
+
+**Clicked Post Field (Form Text)** works in an Atomic Form, but the marker cannot arrive the way it does in a legacy form, because the atomic field widgets expose different props:
+
+| Widget | Marker transport | What is populated |
+|---|---|---|
+| **Input** | `placeholder` — the widget has no value or default-value prop | the live `.value` |
+| **Text area** | `placeholder` — likewise, and the element body stays empty | the live `.value` |
+| **Checkbox** | the **Choice value** prop's real `value` attribute | the submitted `.value`; the checked state is never touched |
+| **Radio button** | the **Choice value** prop's real `value` attribute | the submitted `.value`; the checked state is never touched |
+
+The frontend copies whichever marker it finds into `data-lpb-form-value-marker` on first read, and every later pass reads it from there. That is what makes the binding survive: a placeholder has to be cleared once captured, both because a visitor would otherwise read the raw marker as help text and because Elementor's submit handler falls back to the placeholder for a field's label; and setting `.value` on a radio or checkbox writes through to its `value` attribute, destroying the marker in place. `data-lpb-marker` is deliberately not reused — that attribute already carries the select/radio choice marker.
+
+A marker is only ever read from a placeholder when the field sits inside an Atomic Form — an ancestor `form[data-element_type="e-form"]` (or `data-e-type`) *and* the `data-interaction-id` Elementor's own submit handler keys on — and only when the text begins exactly with `lpb-bind:`. An ordinary placeholder is left alone.
+
+Elementor's atomic Checkbox and Radio templates build `value` with `e('html_attr')` and then print it without `| raw`, so Twig's HTML autoescaping escapes the escaper's own output and the marker's `:` and `|` reach the browser still entity-encoded. One entity layer is decoded before the marker is read. The Input and Text area placeholder is printed *with* `| raw`, arrives one layer shallower, and needs nothing.
+
+Hydrated values reach the server unchanged: Elementor's atomic submit handler reads each field's `.value` off the live DOM when the form is sent, so no synthetic `input`/`change` event is dispatched.
+
+Two limitations follow from the prop schemas rather than from the plugin:
+
+- An Atomic Input or Text area bound to Form Text cannot also show placeholder text, because the placeholder *is* the transport.
+- **Clicked Post Field (Form Select)** and **(Form Radio)** still only generate choices for legacy Elementor form widgets. The atomic Select renders its options from a static `options` prop rather than from per-option dynamic tags, and an atomic Radio button is a standalone widget with no `.elementor-field-subgroup` wrapper to append generated items to, so neither has a place for the `lpb-bind-select:` / `lpb-bind-radio:` markers those tags emit. Bind an atomic Checkbox or Radio's **Choice value** with Form Text instead when a single value is enough.
+
 ---
 
 ## Updates
@@ -326,6 +350,13 @@ The Plugins screen also adds a **Check for updates** row action. That action is 
 ---
 
 ## Changelog
+
+### 1.7.3
+- **Clicked Post Field (Form Text)** now populates Elementor **Atomic Form** fields. Elementor's Atomic Input and Text area have no value or default-value prop, so their only dynamic-tag-capable text setting is the placeholder — the marker rendered as `placeholder="lpb-bind:…"`, which the frontend never read, and the field was skipped. Atomic Input and Text area now populate their live `.value` from the placeholder-borne marker.
+- Atomic **Checkbox** and **Radio button** now populate their submitted value when Form Text is attached to the **Choice value** prop. Only `.value` is written — the checked state is left exactly as the visitor or the widget set it. Elementor's atomic templates print that attribute double-escaped, so the marker's own `:` and `|` arrive entity-encoded; one entity layer is decoded before the marker is read.
+- An atomic marker is preserved in `data-lpb-form-value-marker` the first time it is read, and the raw marker is cleared off the placeholder in the same step, so it is never shown to a visitor and never submitted as the field's label. The same popup can be opened for one post after another and each atomic field takes the new value, because the binding no longer lives in an attribute the fill overwrites.
+- Scalar form bindings now answer to the same "unknown is not empty" guard as every other binding, for base fields as well as custom meta, and are visible to the missing-field refetch — so a narrower payload can no longer blank a field a complete one already filled.
+- Legacy Elementor v3 form fields are unchanged: the HTML `value` attribute and a textarea's default content are still read first, radio and checkbox groups are still reached only through the existing `lpb-bind-radio:` choice path, and **Form Select** / **Form Radio** are untouched.
 
 ### 1.7.2
 - Fixed **Clicked Post Image** not populating in an Atomic Image. Elementor's atomic image template escapes the rendered `src` twice, so the binding marker reached the browser as `?lpb-field=meta&#038;lpb-meta-key=…` and everything after the first separator was invisible to the marker parser — the image resolved with no meta key and kept its placeholder. The frontend now normalises entity-encoded `&` separators when reading a marker.
